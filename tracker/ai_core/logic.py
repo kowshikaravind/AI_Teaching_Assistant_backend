@@ -1,89 +1,98 @@
-# backend/tracker/ai_core/logic.py
 import os
 from dotenv import load_dotenv
-from langchain_google_genai import ChatGoogleGenerativeAI
-from langchain_core.prompts import ChatPromptTemplate
-from langchain_core.output_parsers import PydanticOutputParser
-from pydantic import BaseModel, Field
+import google.generativeai as genai
 
-# 1. Setup
-# Ensure your .env is in the root backend folder
 load_dotenv()
 
-# 2. Define Output Schema
-class StudentAnalysis(BaseModel):
-    student_name: str = Field(description="Name of the student")
-    trend_direction: str = Field(description="One of: 'Improving 📈', 'Stable ➡️', or 'Declining 📉'")
-    predicted_next_grade: int = Field(description="Prediction for the NEXT exam based on the trend")
-    risk_status: str = Field(description="Risk Level: 'Safe', 'At Risk', or 'Critical'")
-    remedial_action: str = Field(description="A specific action plan (max 10 words)")
 
-# 3. The Function (Callable by Django)
-def analyze_student(name, marks_list, attendance, notes=""):
+def build_student_context(name, class_name, attendance, structured_marks, gender=None, parent_number=None):
     """
-    Analyzes a single student and returns a dictionary.
+    Builds a detailed student profile string to inject into chat history.
+    """
+    if structured_marks:
+        marks_table = "Subject          | Test Name             | Date       | Score      | %\n"
+        marks_table += "-" * 70 + "\n"
+        for m in structured_marks:
+            marks_table += (
+                f"{m['subject']:<17}| {m['test_name']:<22}| {m['date']} | "
+                f"{m['marks_obtained']}/{m['total_marks']:<8} | {m['percentage']}%\n"
+            )
+    else:
+        marks_table = "No exam records available yet."
+
+    context = f"""Here is the complete profile of the student you will be analyzing:
+
+=== STUDENT PROFILE ===
+Name: {name}
+Class: {class_name}
+Gender: {gender or 'N/A'}
+Attendance: {attendance}%
+Parent Contact: {parent_number or 'N/A'}
+
+=== EXAM HISTORY (chronological order) ===
+{marks_table}
+
+You are an expert Academic Counselor AI helping a Teaching Assistant.
+Always refer to the student by their name ({name}) in your responses.
+Be specific — reference actual test names, dates, scores, and subjects from the data above.
+Never say you don't have information — all the data you need is above.
+Keep responses clear and concise."""
+
+    return context
+
+
+def chat_with_student_context(student_context, conversation_history):
+    """
+    Sends the conversation to Gemini.
+    
+    Student context is injected as the FIRST message pair in history
+    so Gemini always has the student data — regardless of system_instruction support.
+
+    conversation_history: list of dicts [{"role": "user"|"model", "parts": ["text"]}]
+    The last item is the new user message to respond to.
     """
     try:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
-            return {"error": "Google API Key not found"}
+            return "Error: Google API Key not found."
 
-        llm = ChatGoogleGenerativeAI(model="models/gemini-2.5-flash", temperature=0, google_api_key=api_key)
-        parser = PydanticOutputParser(pydantic_object=StudentAnalysis)
+        genai.configure(api_key=api_key)
 
-        prompt_template = ChatPromptTemplate.from_messages([
-            ("system", "You are an Academic AI. Analyze the student's historical test scores.\n"
-                    "LOGIC RULES:\n"
-                    "1. If the list is going up (e.g., 60, 70), Trend is 'Improving'.\n"
-                    "2. If the list is going down (e.g., 40, 30), Trend is 'Declining'.\n"
-                    "3. If Trend is 'Improving', predict a HIGHER grade next.\n"
-                    "4. If Trend is 'Declining' OR Attendance < 70%, Risk is 'Critical'.\n"
-                    "\n{format_instructions}"),
-            ("human", "Name: {name}\n"
-                    "Attendance: {attendance}%\n"
-                    "Test History: {marks}\n" 
-                    "Notes: {notes}")
-        ])
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config={"temperature": 0.4}
+        )
 
-        prompt = prompt_template.partial(format_instructions=parser.get_format_instructions())
-        chain = prompt | llm | parser
+        # Inject student context as the very first exchange in history.
+        # This guarantees Gemini always knows the student profile,
+        # even if system_instruction is ignored.
+        context_history = [
+            {
+                "role": "user",
+                "parts": [student_context]
+            },
+            {
+                "role": "model",
+                "parts": ["Understood. I have fully reviewed this student's profile and exam history. I'm ready to answer any questions about their academic performance."]
+            }
+        ]
 
-        # Run for single student
-        result = chain.invoke({
-            "name": name,
-            "marks": marks_list,
-            "attendance": attendance,
-            "notes": notes
-        })
-        
-        # Return as dictionary so Django can serialize it to JSON
-        return result.model_dump()
+        # Append all previous conversation turns EXCEPT the last one
+        # (the last one is the new message we're about to send)
+        for turn in conversation_history[:-1]:
+            context_history.append({
+                "role": turn["role"],       # "user" or "model"
+                "parts": [turn["parts"][0]]
+            })
+
+        # Start chat with the full context + history
+        chat = model.start_chat(history=context_history)
+
+        # Send the latest user message
+        latest_message = conversation_history[-1]["parts"][0]
+        response = chat.send_message(latest_message)
+
+        return response.text
 
     except Exception as e:
-        return {"error": str(e)}
-
-# ... (rest of your code above) ...
-
-# --- TEST BLOCK (Runs only when you run this file directly) ---
-if __name__ == "__main__":
-    print("🔬 Running AI Test Mode...")
-    
-    # Test Data
-    test_student = {
-        "name": "Test Student",
-        "marks": [50, 45, 40],  # Declining trend
-        "attendance": 60,       # Critical attendance
-        "notes": "Struggling with basic concepts."
-    }
-
-    # Call the function
-    result = analyze_student(
-        test_student["name"], 
-        test_student["marks"], 
-        test_student["attendance"], 
-        test_student["notes"]
-    )
-
-    # Print Result
-    import json
-    print(json.dumps(result, indent=2))
+        return f"Error: {str(e)}"
