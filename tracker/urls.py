@@ -12,7 +12,6 @@ from .views import (
 from .views import ClassChatView
 
 
-
 urlpatterns = [
     # ── Students ──────────────────────────────────────────────────
     path('students/', StudentListCreateView.as_view()),
