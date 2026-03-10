@@ -10,7 +10,7 @@ from .views import (
     StudentChatView,
 )
 from .views import ClassChatView
-
+from .views import SubjectListCreateView, SubjectDeleteView
 
 urlpatterns = [
     # ── Students ──────────────────────────────────────────────────
@@ -30,4 +30,7 @@ urlpatterns = [
     path('students/<int:pk>/chat/', StudentChatView.as_view()),
 
     path('class-chat/', ClassChatView.as_view()),
+    
+    path('subjects/', SubjectListCreateView.as_view()),
+    path('subjects/<int:pk>/', SubjectDeleteView.as_view()),
 ]

@@ -3,8 +3,8 @@ from rest_framework.views import APIView
 from rest_framework.response import Response
 from django.shortcuts import get_object_or_404
 
-from .models import Student, TestMark, Attendance
-from .serializers import StudentSerializer, TestMarkSerializer, AttendanceSerializer
+from .models import Student, TestMark, Attendance, Subject
+from .serializers import StudentSerializer, TestMarkSerializer, AttendanceSerializer, SubjectSerializer
 from tracker.ai_core.logic import build_student_context, chat_with_student_context
 
 
@@ -310,3 +310,10 @@ Keep answers clear and concise. Do not make up data that is not shown above."""
 
         return Response({"reply": response.text})
 
+class SubjectListCreateView(generics.ListCreateAPIView):
+    queryset = Subject.objects.all().order_by('name')
+    serializer_class = SubjectSerializer
+
+class SubjectDeleteView(generics.DestroyAPIView):
+    queryset = Subject.objects.all()
+    serializer_class = SubjectSerializer
