@@ -1,11 +1,14 @@
 from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
+from rest_framework.decorators import api_view
 from django.shortcuts import get_object_or_404
 
 from .models import Student, TestMark, Attendance, Subject
 from .serializers import StudentSerializer, TestMarkSerializer, AttendanceSerializer, SubjectSerializer
 from tracker.ai_core.logic import build_student_context, chat_with_student_context
+
+
 
 
 # ── STUDENT VIEWS ─────────────────────────────────────────────────────────────
@@ -317,3 +320,24 @@ class SubjectListCreateView(generics.ListCreateAPIView):
 class SubjectDeleteView(generics.DestroyAPIView):
     queryset = Subject.objects.all()
     serializer_class = SubjectSerializer
+
+#-----------------------------------Login Authentication for Students----------------------------------
+
+@api_view(['POST'])
+def StudentLoginView(request):
+    roll_number = request.data.get('roll_number', '').strip()
+    dob = request.data.get('dob', '').strip()
+
+    if not roll_number or not dob:
+        return Response({'error': 'Roll number and date of birth are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    try:
+        student = Student.objects.get(roll_number=roll_number, dob=dob)
+        return Response({
+            'id': student.id,
+            'name': student.name,
+            'class_name': student.class_name,
+            'roll_number': student.roll_number,
+        })
+    except Student.DoesNotExist:
+        return Response({'error': 'Invalid roll number or date of birth.'}, status=status.HTTP_401_UNAUTHORIZED)
