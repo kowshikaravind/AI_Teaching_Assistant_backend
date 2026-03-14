@@ -12,6 +12,12 @@ from .views import (
     SubjectListCreateView,
     SubjectDeleteView,
     StudentLoginView,
+    StudentChangePasswordView,
+    UpcomingTestListCreateView,
+    UpcomingTestRetrieveUpdateDestroyView,
+    NotificationListView,
+    NotificationMarkReadView,
+    NotificationMarkAllReadView,
 )
 
 urlpatterns = [
@@ -36,6 +42,16 @@ urlpatterns = [
     path('subjects/', SubjectListCreateView.as_view()),
     path('subjects/<int:pk>/', SubjectDeleteView.as_view()),
 
+    # ── Upcoming Tests ────────────────────────────────────────────
+    path('upcoming-tests/', UpcomingTestListCreateView.as_view()),
+    path('upcoming-tests/<int:pk>/', UpcomingTestRetrieveUpdateDestroyView.as_view()),
+
+    # ── Notifications ─────────────────────────────────────────────
+    path('notifications/', NotificationListView.as_view()),
+    path('notifications/<int:pk>/read/', NotificationMarkReadView.as_view()),
+    path('notifications/mark-all-read/', NotificationMarkAllReadView.as_view()),
+
     # ── Student Login ─────────────────────────────────────────────
     path('student-login/', StudentLoginView),   # ← no .as_view() since it's a function view
+    path('student-change-password/', StudentChangePasswordView),
 ]
