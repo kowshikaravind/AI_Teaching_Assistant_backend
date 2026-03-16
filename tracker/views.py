@@ -5,7 +5,7 @@ from rest_framework.decorators import api_view
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.hashers import check_password, make_password
 
-from .models import Student, TestMark, Attendance, Subject, UpcomingTest, Notification
+from .models import Student, TestMark, Attendance, Subject, UpcomingTest, Notification, AdminCredential, TeacherCredential
 from .serializers import StudentSerializer, TestMarkSerializer, AttendanceSerializer, SubjectSerializer, UpcomingTestSerializer, NotificationSerializer
 from tracker.ai_core.logic import build_student_context, chat_with_student_context
 
@@ -503,6 +503,15 @@ class UpcomingTestRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIVie
     queryset = UpcomingTest.objects.all()
     serializer_class = UpcomingTestSerializer
 
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        if instance.status != 'scheduled':
+            return Response(
+                {'error': 'Only scheduled tests can be deleted.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        return super().destroy(request, *args, **kwargs)
+
 
 class NotificationListView(generics.ListAPIView):
     queryset = Notification.objects.select_related('student').all()
@@ -604,3 +613,277 @@ def StudentChangePasswordView(request):
     student.save(update_fields=['student_password'])
 
     return Response({'message': 'Password updated successfully.'}, status=status.HTTP_200_OK)
+
+
+# ── BULK MARK ENTRY VIEW ──────────────────────────────────────────────────────
+
+class BulkMarkEntryView(APIView):
+    """
+    POST /api/testmarks/bulk/
+
+    Submit marks for all students in a test at once.
+    The test's class_name is used to validate that only students
+    belonging to that class can have marks entered.
+
+    Request body:
+    {
+        "test_id": 5,
+        "marks": [
+            {"student_id": 1, "marks_obtained": 78},
+            {"student_id": 2, "marks_obtained": 65},
+            {"student_id": 3, "marks_obtained": 90}
+        ]
+    }
+
+    Response: list of created TestMark ids.
+    """
+    def post(self, request):
+        test_id = request.data.get('test_id')
+        marks_data = request.data.get('marks', [])
+
+        if not test_id:
+            return Response({'error': 'test_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not marks_data:
+            return Response({'error': 'No marks provided.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        test = get_object_or_404(UpcomingTest, pk=test_id)
+
+        if test.status == 'finished':
+            return Response({'error': 'Marks for this test have already been submitted.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Collect all valid student IDs for this class
+        class_student_ids = set(
+            Student.objects.filter(class_name=test.class_name).values_list('id', flat=True)
+        )
+
+        created = []
+        errors = []
+
+        for entry in marks_data:
+            student_id = entry.get('student_id')
+            marks_obtained = entry.get('marks_obtained')
+
+            # Skip rows where the teacher left the field blank
+            if marks_obtained is None or str(marks_obtained).strip() == '':
+                continue
+
+            # Security: only allow students from the test's class
+            if student_id not in class_student_ids:
+                errors.append({'student_id': student_id, 'error': 'Student does not belong to test class.'})
+                continue
+
+            try:
+                marks_obtained = float(marks_obtained)
+            except (TypeError, ValueError):
+                errors.append({'student_id': student_id, 'error': 'Invalid marks value.'})
+                continue
+
+            if marks_obtained < 0 or marks_obtained > test.total_marks:
+                errors.append({
+                    'student_id': student_id,
+                    'error': f'Marks must be between 0 and {test.total_marks}.',
+                })
+                continue
+
+            student = get_object_or_404(Student, pk=student_id)
+
+            mark = TestMark.objects.create(
+                student=student,
+                subject=test.subject or test.topic,
+                test_name=test.test_name,
+                marks_obtained=marks_obtained,
+                total_marks=test.total_marks,
+                date_taken=test.test_date,
+            )
+            _run_performance_analysis(mark)
+            created.append(mark.id)
+
+        if errors and not created:
+            return Response({'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
+
+        # Mark the test as finished after all marks are saved
+        test.status = 'finished'
+        test.save(update_fields=['status'])
+
+        return Response({
+            'created': len(created),
+            'mark_ids': created,
+            'errors': errors,
+            'test_status': 'finished',
+        }, status=status.HTTP_201_CREATED)
+
+
+def _get_or_create_default_admin():
+    admin = AdminCredential.objects.order_by('id').first()
+    if admin:
+        return admin
+    return AdminCredential.objects.create(
+        username='admin',
+        password=make_password('admin123'),
+    )
+
+
+@api_view(['POST'])
+def AdminLoginView(request):
+    username = request.data.get('username', '').strip()
+    password = request.data.get('password', '').strip()
+
+    if not username or not password:
+        return Response({'error': 'Username and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    _get_or_create_default_admin()
+    admin = AdminCredential.objects.filter(username=username).first()
+    if not admin or not check_password(password, admin.password):
+        return Response({'error': 'Invalid admin credentials.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    return Response({'username': admin.username, 'message': 'Admin login successful.'}, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+def AdminChangeCredentialsView(request):
+    current_username = request.data.get('current_username', '').strip()
+    current_password = request.data.get('current_password', '').strip()
+    new_username = request.data.get('new_username', '').strip()
+    new_password = request.data.get('new_password', '').strip()
+
+    if not current_username or not current_password or not new_username or not new_password:
+        return Response({'error': 'All fields are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    _get_or_create_default_admin()
+    admin = AdminCredential.objects.filter(username=current_username).first()
+    if not admin or not check_password(current_password, admin.password):
+        return Response({'error': 'Current credentials are invalid.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    if len(new_password) < 6:
+        return Response({'error': 'New password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    username_taken = AdminCredential.objects.exclude(pk=admin.pk).filter(username=new_username).exists()
+    if username_taken:
+        return Response({'error': 'New username is already taken.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    admin.username = new_username
+    admin.password = make_password(new_password)
+    admin.save(update_fields=['username', 'password', 'updated_at'])
+    return Response({'message': 'Admin credentials updated successfully.', 'username': admin.username}, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+def TeacherRegisterView(request):
+    teacher_name = request.data.get('teacher_name', '').strip()
+    username = request.data.get('username', '').strip().lower()
+    password = request.data.get('password', '').strip()
+    department = request.data.get('department', '').strip()
+
+    if not teacher_name or not username or not password:
+        return Response({'error': 'Teacher name, username/email, and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if len(password) < 6:
+        return Response({'error': 'Password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    existing = TeacherCredential.objects.filter(username=username).first()
+    if existing and existing.status == 'approved':
+        return Response({'error': 'This teacher account is already approved. Please log in.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if existing and existing.status == 'pending':
+        return Response({'error': 'A request with this username/email is already pending approval.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    if existing and existing.status == 'rejected':
+        existing.teacher_name = teacher_name
+        existing.department = department
+        existing.password = make_password(password)
+        existing.status = 'pending'
+        existing.save(update_fields=['teacher_name', 'department', 'password', 'status', 'updated_at'])
+        return Response({'message': 'Teacher account request submitted and is pending approval.', 'status': 'pending'}, status=status.HTTP_201_CREATED)
+
+    TeacherCredential.objects.create(
+        teacher_name=teacher_name,
+        username=username,
+        password=make_password(password),
+        department=department,
+        status='pending',
+    )
+    return Response({'message': 'Teacher account request submitted and is pending approval.', 'status': 'pending'}, status=status.HTTP_201_CREATED)
+
+
+@api_view(['POST'])
+def TeacherLoginView(request):
+    username = request.data.get('username', '').strip().lower()
+    password = request.data.get('password', '').strip()
+
+    if not username or not password:
+        return Response({'error': 'Username/email and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    teacher = TeacherCredential.objects.filter(username=username).first()
+    if not teacher or not check_password(password, teacher.password):
+        return Response({'error': 'Invalid credentials. Please try again.'}, status=status.HTTP_401_UNAUTHORIZED)
+
+    if teacher.status == 'pending':
+        return Response({'error': 'Your account request is waiting for Admin approval.'}, status=status.HTTP_403_FORBIDDEN)
+
+    if teacher.status == 'rejected':
+        return Response({'error': 'Your teacher access has been revoked. Contact the administrator.'}, status=status.HTTP_403_FORBIDDEN)
+
+    return Response({
+        'id': teacher.id,
+        'username': teacher.username,
+        'teacher_name': teacher.teacher_name,
+        'department': teacher.department,
+        'role': 'teacher',
+    }, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+def PendingTeacherListView(request):
+    rows = TeacherCredential.objects.filter(status='pending').order_by('-created_at')
+    data = [
+        {
+            'teacher_id': row.id,
+            'teacher_name': row.teacher_name,
+            'username': row.username,
+            'department': row.department,
+            'status': row.status,
+        }
+        for row in rows
+    ]
+    return Response(data, status=status.HTTP_200_OK)
+
+
+@api_view(['GET'])
+def ApprovedTeacherListView(request):
+    rows = TeacherCredential.objects.filter(status='approved').order_by('teacher_name')
+    data = [
+        {
+            'teacher_id': row.id,
+            'teacher_name': row.teacher_name,
+            'username': row.username,
+            'department': row.department,
+            'status': row.status,
+        }
+        for row in rows
+    ]
+    return Response(data, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+def ApproveTeacherView(request, pk):
+    teacher = get_object_or_404(TeacherCredential, pk=pk)
+    teacher.status = 'approved'
+    teacher.save(update_fields=['status', 'updated_at'])
+    return Response({'message': 'Teacher approved successfully.'}, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+def RejectTeacherView(request, pk):
+    teacher = get_object_or_404(TeacherCredential, pk=pk)
+    teacher.status = 'rejected'
+    teacher.save(update_fields=['status', 'updated_at'])
+    return Response({'message': 'Teacher request rejected.'}, status=status.HTTP_200_OK)
+
+
+@api_view(['DELETE'])
+def RevokeTeacherAccessView(request, pk):
+    teacher = get_object_or_404(TeacherCredential, pk=pk)
+    teacher.status = 'rejected'
+    teacher.save(update_fields=['status', 'updated_at'])
+    return Response({'message': 'Teacher access removed.'}, status=status.HTTP_200_OK)

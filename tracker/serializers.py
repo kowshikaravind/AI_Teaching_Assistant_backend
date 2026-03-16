@@ -1,6 +1,6 @@
 from rest_framework import serializers
 from django.contrib.auth.hashers import make_password
-from .models import Student, TestMark, Attendance , Subject, UpcomingTest, Notification
+from .models import Student, TestMark, Attendance, Subject, UpcomingTest, Notification
 
 
 class TestMarkSerializer(serializers.ModelSerializer):
@@ -52,6 +52,7 @@ class StudentSerializer(serializers.ModelSerializer):
             'test_marks',
         ]
 
+
 class SubjectSerializer(serializers.ModelSerializer):
     class Meta:
         model = Subject
@@ -74,12 +75,13 @@ class UpcomingTestSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = UpcomingTest
-        fields = ['id', 'test_name', 'subject', 'topic', 'test_date', 'total_marks', 'class_name', 'created_at']
+        fields = ['id', 'test_name', 'subject', 'topic', 'test_date', 'total_marks', 'class_name', 'status', 'created_at']
 
 
 class NotificationSerializer(serializers.ModelSerializer):
     student_name = serializers.CharField(source='student.name', read_only=True)
     class_name = serializers.CharField(source='student.class_name', read_only=True)
+    timestamp = serializers.DateTimeField(source='created_at', read_only=True)
 
     class Meta:
         model = Notification
@@ -96,5 +98,3 @@ class NotificationSerializer(serializers.ModelSerializer):
             'read_status',
             'details',
         ]
-
-    timestamp = serializers.DateTimeField(source='created_at', read_only=True)

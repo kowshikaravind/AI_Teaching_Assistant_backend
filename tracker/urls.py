@@ -18,6 +18,16 @@ from .views import (
     NotificationListView,
     NotificationMarkReadView,
     NotificationMarkAllReadView,
+    BulkMarkEntryView,
+    AdminLoginView,
+    AdminChangeCredentialsView,
+    TeacherRegisterView,
+    TeacherLoginView,
+    PendingTeacherListView,
+    ApprovedTeacherListView,
+    ApproveTeacherView,
+    RejectTeacherView,
+    RevokeTeacherAccessView,
 )
 
 urlpatterns = [
@@ -28,6 +38,7 @@ urlpatterns = [
     # ── Test Marks ────────────────────────────────────────────────
     path('testmarks/', TestMarkListCreateView.as_view()),
     path('testmarks/<int:pk>/', TestMarkRetrieveDestroyView.as_view()),
+    path('testmarks/bulk/', BulkMarkEntryView.as_view()),
 
     # ── Attendance ────────────────────────────────────────────────
     path('attendance/save/', AttendanceBulkSaveView.as_view()),
@@ -54,4 +65,15 @@ urlpatterns = [
     # ── Student Login ─────────────────────────────────────────────
     path('student-login/', StudentLoginView),   # ← no .as_view() since it's a function view
     path('student-change-password/', StudentChangePasswordView),
+
+    # ── Admin / Teacher Access Management ────────────────────────
+    path('admin-login/', AdminLoginView),
+    path('admin-change-credentials/', AdminChangeCredentialsView),
+    path('teacher-register/', TeacherRegisterView),
+    path('teacher-login/', TeacherLoginView),
+    path('admin/teachers/pending/', PendingTeacherListView),
+    path('admin/teachers/approved/', ApprovedTeacherListView),
+    path('admin/teachers/<int:pk>/approve/', ApproveTeacherView),
+    path('admin/teachers/<int:pk>/reject/', RejectTeacherView),
+    path('admin/teachers/<int:pk>/revoke/', RevokeTeacherAccessView),
 ]

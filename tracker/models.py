@@ -61,12 +61,18 @@ class Subject(models.Model):
 
 
 class UpcomingTest(models.Model):
+    STATUS_CHOICES = [
+        ('scheduled', 'Scheduled'),
+        ('finished', 'Finished'),
+    ]
+
     test_name = models.CharField(max_length=120)
     subject = models.CharField(max_length=120, default='General')
     topic = models.CharField(max_length=255, blank=True, default='')
     test_date = models.DateField()
     total_marks = models.PositiveIntegerField()
     class_name = models.CharField(max_length=50)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='scheduled')
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -103,3 +109,38 @@ class Notification(models.Model):
 
     def __str__(self):
         return f"{self.recipient_role}:{self.type}:{self.student.name}"
+
+
+class AdminCredential(models.Model):
+    username = models.CharField(max_length=100, unique=True)
+    password = models.CharField(max_length=128)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+
+    def __str__(self):
+        return f"Admin: {self.username}"
+
+
+class TeacherCredential(models.Model):
+    STATUS_CHOICES = [
+        ('pending', 'Pending Approval'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+    ]
+
+    teacher_name = models.CharField(max_length=120)
+    username = models.CharField(max_length=120, unique=True)
+    password = models.CharField(max_length=128)
+    department = models.CharField(max_length=120, blank=True, default='')
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['status', '-created_at']
+
+    def __str__(self):
+        return f"{self.teacher_name} ({self.username}) - {self.status}"
