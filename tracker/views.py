@@ -4,10 +4,23 @@ from rest_framework.response import Response
 from rest_framework.decorators import api_view
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.hashers import check_password, make_password
+from django.utils import timezone
+from django.core.cache import cache
+from django.db import connection
+import logging
 
-from .models import Student, TestMark, Attendance, Subject, UpcomingTest, Notification, AdminCredential, TeacherCredential
-from .serializers import StudentSerializer, TestMarkSerializer, AttendanceSerializer, SubjectSerializer, UpcomingTestSerializer, NotificationSerializer
-from tracker.ai_core.logic import build_student_context, chat_with_student_context
+from .models import Student, TestMark, TestQuestion, Subject, UpcomingTest, Notification, AdminCredential, TeacherCredential, StudentTestResponse, TestResult, TestAttempt
+from .serializers import StudentSerializer, TestMarkSerializer, SubjectSerializer, UpcomingTestSerializer, NotificationSerializer, TestQuestionSerializer
+from tracker.ai_core.logic import (
+    build_student_context,
+    chat_with_student_context,
+    analyze_conceptual_mistakes,
+    analyze_test_behavior,
+    build_ai_tutor_context,
+    fallback_student_chat_response,
+)
+
+logger = logging.getLogger(__name__)
 
 
 def _normalize_subject(subject):
@@ -137,6 +150,64 @@ def _run_performance_analysis(new_mark):
         )
 
 
+def _student_has_submitted_test(student, test):
+    if _table_exists('tracker_testattempt') and TestAttempt.objects.filter(student=student, test=test).exists():
+        return True
+
+    if _table_exists('tracker_testresult') and TestResult.objects.filter(student=student, test=test).exclude(status='InProgress').exists():
+        return True
+
+    normalized_subject = _normalize_subject(test.subject or test.topic or 'General')
+    test_name_key = ' '.join(str(test.test_name or '').strip().lower().split())
+    marks = TestMark.objects.filter(
+        student=student,
+        test_name=test.test_name,
+        date_taken=test.test_date,
+    )
+
+    matched = any(
+        _normalize_subject(mark.subject) == normalized_subject
+        and ' '.join(str(mark.test_name or '').strip().lower().split()) == test_name_key
+        for mark in marks
+    )
+
+    logger.warning(
+        'TEST_SUBMISSION_MATCH_DEBUG student_id=%s test_id=%s subject=%s name=%s date=%s candidates=%s matched=%s',
+        student.id,
+        test.id,
+        normalized_subject,
+        test_name_key,
+        str(test.test_date),
+        marks.count(),
+        matched,
+    )
+
+    return matched
+
+
+def _workflow_status(test):
+    if test.status == 'finished':
+        return 'Completed'
+    if test.status == 'active':
+        return 'Active'
+    return 'Published' if bool(test.questions_generated) else 'Draft'
+
+
+def _coerce_aware_datetime(value):
+    if value in (None, ''):
+        return None
+
+    if isinstance(value, timezone.datetime):
+        dt = value
+    else:
+        dt = timezone.datetime.fromisoformat(str(value).replace('Z', '+00:00'))
+
+    if timezone.is_naive(dt):
+        dt = timezone.make_aware(dt, timezone.get_current_timezone())
+
+    return dt
+
+
 
 
 # ── STUDENT VIEWS ─────────────────────────────────────────────────────────────
@@ -144,6 +215,20 @@ def _run_performance_analysis(new_mark):
 class StudentListCreateView(generics.ListCreateAPIView):
     queryset = Student.objects.all()
     serializer_class = StudentSerializer
+
+    def get_queryset(self):
+        """
+        Filter students by assigned_class if provided in query params.
+        Teachers see only students from their assigned class.
+        """
+        queryset = Student.objects.all()
+        assigned_class = self.request.query_params.get('assigned_class')
+        
+        if assigned_class and assigned_class != 'Class N/A':
+            # Filter by class_name matching assigned_class
+            queryset = queryset.filter(class_name=assigned_class)
+        
+        return queryset
 
 
 class StudentRetriveDestroyView(generics.RetrieveUpdateDestroyAPIView):
@@ -159,8 +244,14 @@ class TestMarkListCreateView(generics.ListCreateAPIView):
 
     def get_queryset(self):
         student_id = self.request.query_params.get('student_id')
+        assigned_class = self.request.query_params.get('assigned_class')
+
         if student_id:
             return TestMark.objects.filter(student_id=student_id)
+
+        if assigned_class and assigned_class != 'Class N/A':
+            return TestMark.objects.filter(student__class_name=assigned_class)
+
         return TestMark.objects.all()
 
     def perform_create(self, serializer):
@@ -173,141 +264,6 @@ class TestMarkRetrieveDestroyView(generics.RetrieveDestroyAPIView):
     serializer_class = TestMarkSerializer
 
 
-# ── ATTENDANCE VIEWS ──────────────────────────────────────────────────────────
-
-class AttendanceBulkSaveView(APIView):
-    """
-    POST /api/attendance/save/
-
-    Saves attendance for multiple students in one request.
-    If a record already exists for that student + date, it updates it.
-    If not, it creates a new one.
-
-    Request body:
-    {
-        "date": "2026-03-09",
-        "records": [
-            {"student_id": 1, "status": "present"},
-            {"student_id": 2, "status": "absent"},
-            {"student_id": 3, "status": "not_marked"}
-        ]
-    }
-    """
-    def post(self, request):
-        date = request.data.get('date')
-        records = request.data.get('records', [])
-
-        if not date:
-            return Response({"error": "Date is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not records:
-            return Response({"error": "No records provided."}, status=status.HTTP_400_BAD_REQUEST)
-
-        saved = []
-        errors = []
-
-        for record in records:
-            student_id = record.get('student_id')
-            att_status = record.get('status', 'not_marked')
-
-            try:
-                student = Student.objects.get(pk=student_id)
-
-                # update_or_create — safe to call multiple times for same date
-                attendance, created = Attendance.objects.update_or_create(
-                    student=student,
-                    date=date,
-                    defaults={'status': att_status}
-                )
-                saved.append({
-                    "student_id": student_id,
-                    "student_name": student.name,
-                    "status": att_status,
-                    "created": created
-                })
-
-            except Student.DoesNotExist:
-                errors.append({"student_id": student_id, "error": "Student not found"})
-
-        return Response({
-            "date": date,
-            "saved": len(saved),
-            "errors": errors,
-            "records": saved
-        }, status=status.HTTP_200_OK)
-
-
-class AttendanceSummaryView(APIView):
-    """
-    GET /api/students/<id>/attendance-summary/
-
-    Returns attendance summary for a single student.
-    Used by the AI chat to get real attendance data.
-
-    Response:
-    {
-        "total_sessions": 20,
-        "present": 16,
-        "absent": 4,
-        "percentage": 80,
-        "recent_absences": ["2026-03-01", "2026-03-05"]
-    }
-    """
-    def get(self, request, pk):
-        student = get_object_or_404(Student, pk=pk)
-        records = Attendance.objects.filter(student=student).order_by('date')
-
-        total = records.count()
-        present = records.filter(status='present').count()
-        absent = records.filter(status='absent').count()
-        percentage = round((present / total) * 100) if total > 0 else 0
-
-        # Last 5 absent dates for the AI context
-        recent_absences = list(
-            records.filter(status='absent')
-            .order_by('-date')
-            .values_list('date', flat=True)[:5]
-        )
-        recent_absences = [str(d) for d in recent_absences]
-
-        return Response({
-            "total_sessions": total,
-            "present": present,
-            "absent": absent,
-            "percentage": percentage,
-            "recent_absences": recent_absences,
-        })
-
-
-class AttendanceByDateView(APIView):
-    """
-    GET /api/attendance/?date=2026-03-09&class_name=11-SectionA
-
-    Returns all attendance records for a given date (and optionally class).
-    Used to reload previously saved attendance when the teacher reopens a date.
-    """
-    def get(self, request):
-        date = request.query_params.get('date')
-        class_name = request.query_params.get('class_name')
-
-        if not date:
-            return Response({"error": "Date is required."}, status=status.HTTP_400_BAD_REQUEST)
-
-        records = Attendance.objects.filter(date=date).select_related('student')
-
-        if class_name:
-            records = records.filter(student__class_name=class_name)
-
-        result = [
-            {
-                "student_id": r.student.id,
-                "student_name": r.student.name,
-                "status": r.status
-            }
-            for r in records
-        ]
-
-        return Response({"date": date, "records": result})
 
 
 # ── AI CHAT VIEW ──────────────────────────────────────────────────────────────
@@ -328,6 +284,8 @@ class StudentChatView(APIView):
     def post(self, request, pk):
         student = get_object_or_404(Student, pk=pk)
         history = request.data.get("history", [])
+        subject_focus = str(request.data.get("subject_name", "")).strip()
+        subject_insights = request.data.get("subject_insights", {}) or {}
 
         if not history:
             return Response({"error": "No conversation history provided."}, status=status.HTTP_400_BAD_REQUEST)
@@ -346,104 +304,215 @@ class StudentChatView(APIView):
                 "percentage": percentage
             })
 
-        # Get REAL attendance from database
-        att_records = Attendance.objects.filter(student=student)
-        total_sessions = att_records.count()
-        present_count = att_records.filter(status='present').count()
-        attendance_pct = round((present_count / total_sessions) * 100) if total_sessions > 0 else 0
+        # Build AI context with real test data.
+        insights_lines = []
+        if isinstance(subject_insights, dict):
+            avg = subject_insights.get('avg_score')
+            recent = subject_insights.get('recent_score')
+            concepts = subject_insights.get('conceptual_mistakes') or []
+            behaviors = subject_insights.get('behavior_patterns') or []
+            if avg is not None:
+                insights_lines.append(f"Average Score: {avg}%")
+            if recent is not None:
+                insights_lines.append(f"Recent Score: {recent}%")
+            if concepts:
+                insights_lines.append("Conceptual Mistakes: " + "; ".join([str(x) for x in concepts]))
+            if behaviors:
+                insights_lines.append("Behavior Patterns: " + "; ".join([str(x) for x in behaviors]))
 
-        # Build AI context with real attendance
         system_prompt = build_student_context(
             name=student.name,
             class_name=student.class_name,
-            attendance=attendance_pct,
             structured_marks=structured_marks,
             gender=student.gender,
             parent_number=student.parent_number,
+            subject_focus=subject_focus or None,
+            subject_insights='\n'.join(insights_lines) if insights_lines else None,
         )
 
         reply = chat_with_student_context(system_prompt, history)
+        if isinstance(reply, str) and reply.startswith('Error:'):
+            latest_message = history[-1].get('parts', ['']) if history else ['']
+            reply = fallback_student_chat_response(
+                student_name=student.name,
+                subject_name=subject_focus,
+                subject_insights=subject_insights,
+                latest_message=latest_message[0] if latest_message else '',
+            )
         return Response({"reply": reply})
 
 
-
-class ClassChatView(APIView):
+class StudentAITutorView(APIView):
     """
-    POST /api/class-chat/
-
-    A class-wide AI chat. The teacher can ask anything about
-    any student or the whole class. All student data is injected
-    as context so Gemini always has the full picture.
-
-    Body:
+    GET /api/students/<id>/ai-tutor/
+    
+    Returns subject-wise analysis data for the AI Tutor page.
+    
+    Response:
     {
-        "message": "Who is struggling the most?",
-        "history": [...],           # previous messages in Gemini format
-        "student_ids": [1, 2, 3]
+        "subjects": [
+            {
+                "name": "Mathematics",
+                "test_count": 3,
+                "avg_score": 75,
+                "recent_score": 80,
+                "conceptual_mistakes": ["Pattern 1", "Pattern 2"],
+                "behavior_patterns": ["Pattern 1", "Pattern 2"]
+            },
+            ...
+        ]
     }
     """
-    def post(self, request):
-        message = request.data.get("message", "").strip()
-        history = request.data.get("history", [])
-        student_ids = request.data.get("student_ids", [])
-
-        if not message:
-            return Response({"error": "No message provided."}, status=status.HTTP_400_BAD_REQUEST)
-
-        # ── BUILD CLASS CONTEXT ───────────────────────────────────
-        students = Student.objects.filter(id__in=student_ids)
-        lines = ["CLASS PERFORMANCE DATA\n" + "=" * 40]
-
-        for student in students:
-            marks = TestMark.objects.filter(student=student).order_by('date_taken')
-            att = Attendance.objects.filter(student=student)
-            total_att = att.count()
-            present_att = att.filter(status='present').count()
-            att_pct = round((present_att / total_att) * 100) if total_att > 0 else "No data"
-
-            lines.append(f"\nStudent: {student.name} | Class: {student.class_name} | Attendance: {att_pct}%")
-
-            if marks.exists():
-                by_subject = {}
-                for m in marks:
-                    pct = round((m.marks_obtained / m.total_marks) * 100)
-                    if m.subject not in by_subject:
-                        by_subject[m.subject] = []
-                    by_subject[m.subject].append(f"{pct}% ({m.date_taken})")
-
-                for subject, scores in by_subject.items():
-                    lines.append(f"  {subject}: {' → '.join(scores)}")
+    def get(self, request, pk):
+        student = get_object_or_404(Student, pk=pk)
+        
+        # Check if TestAttempt table exists before querying
+        try:
+            if _table_exists('tracker_testattempt'):
+                attempts = list(
+                    TestAttempt.objects
+                    .filter(student=student)
+                    .select_related('test')
+                    .order_by('test__subject', 'test__test_date', 'test__id')
+                )
             else:
-                lines.append("  No marks recorded yet.")
+                attempts = []
+        except Exception:
+            attempts = []
+        
+        marks = list(TestMark.objects.filter(student=student).order_by('date_taken', 'id'))
 
-        class_context = "\n".join(lines)
+        grouped = {}
+        attempt_keys = set()
 
-        system_context = f"""You are an AI assistant helping a teacher understand their class performance.
-You have access to real data for every student including their test scores per subject over time and attendance.
+        for attempt in attempts:
+            subject = _subject_label(attempt.test.subject or attempt.test.topic or 'General')
+            key = (
+                _normalize_subject(subject),
+                ' '.join(str(attempt.test.test_name or '').strip().lower().split()),
+                str(attempt.test.test_date),
+            )
+            attempt_keys.add(key)
+            grouped.setdefault(subject, []).append({
+                'attempt': attempt,
+                'test': attempt.test,
+                'mark': None,
+            })
 
-{class_context}
+        for mark in marks:
+            subject = _subject_label(mark.subject or 'General')
+            key = (
+                _normalize_subject(subject),
+                ' '.join(str(mark.test_name or '').strip().lower().split()),
+                str(mark.date_taken),
+            )
+            if key in attempt_keys:
+                continue
 
-Answer the teacher's questions using this data. Be specific — mention student names, exact scores, and trends.
-If asked about a specific student, focus on their data. If asked about the class, summarise across all students.
-Keep answers clear and concise. Do not make up data that is not shown above."""
+            test = (
+                UpcomingTest.objects
+                .filter(test_name=mark.test_name, test_date=mark.date_taken)
+                .filter(subject__iexact=subject)
+                .order_by('id')
+                .first()
+            )
+            if not test:
+                test = (
+                    UpcomingTest.objects
+                    .filter(test_name=mark.test_name, test_date=mark.date_taken)
+                    .order_by('id')
+                    .first()
+                )
 
-        # ── CALL GEMINI ───────────────────────────────────────────
-        import google.generativeai as genai
-        import os
-        genai.configure(api_key=os.getenv("GEMINI_API_KEY"))
-        model = genai.GenerativeModel("gemini-2.5-flash")
+            grouped.setdefault(subject, []).append({
+                'attempt': None,
+                'test': test,
+                'mark': mark,
+            })
 
-        # Inject context as first exchange so Gemini always sees it
-        full_history = [
-            {"role": "user", "parts": [system_context]},
-            {"role": "model", "parts": ["Understood. I have the full class data loaded. What would you like to know?"]},
-            *history,
-        ]
+        subjects_data = []
+        for subject, subject_attempts in grouped.items():
+            subject_attempts.sort(
+                key=lambda item: (
+                    str(item['test'].test_date if item['test'] else item['mark'].date_taken),
+                    int(item['test'].id if item['test'] else item['mark'].id),
+                )
+            )
+            test_entries = []
+            scores = []
 
-        chat = model.start_chat(history=full_history)
-        response = chat.send_message(message)
+            for item in subject_attempts:
+                attempt = item['attempt']
+                test = item['test']
+                mark = item['mark']
 
-        return Response({"reply": response.text})
+                score = float((attempt.score if attempt else (mark.marks_obtained if mark else 0)) or 0)
+                total_marks = float((attempt.total_marks if attempt else (mark.total_marks if mark else 0)) or 0)
+
+                if total_marks:
+                    pct = round((score / total_marks) * 100)
+                    scores.append(pct)
+                else:
+                    pct = 0
+
+                conceptual_patterns = attempt.conceptual_patterns if attempt else []
+                behavior_patterns = attempt.behavior_patterns if attempt else []
+
+                # Backfill older attempts once, then reuse stored result.
+                if test and (not conceptual_patterns or not behavior_patterns):
+                    questions_data = _question_level_rows(test, student)
+                    conceptual_patterns = analyze_conceptual_mistakes(questions_data) if questions_data else ["No review available."]
+                    behavior_patterns = analyze_test_behavior(questions_data) if questions_data else ["No review available."]
+                    if attempt and _table_exists('tracker_testattempt'):
+                        attempt.conceptual_patterns = conceptual_patterns
+                        attempt.behavior_patterns = behavior_patterns
+                        attempt.save(update_fields=['conceptual_patterns', 'behavior_patterns', 'updated_at'])
+                    elif mark and _table_exists('tracker_testattempt'):
+                        attempt, _ = TestAttempt.objects.update_or_create(
+                            student=student,
+                            test=test,
+                            defaults=_legacy_attempt_defaults(
+                                student,
+                                test,
+                                mark,
+                                questions_data,
+                                conceptual_patterns,
+                                behavior_patterns,
+                            ),
+                        )
+
+                test_entries.append({
+                    'test_id': test.id if test else f"legacy-{mark.id}",
+                    'test_name': test.test_name if test else mark.test_name,
+                    'test_date': test.test_date if test else mark.date_taken,
+                    'score': score,
+                    'total_marks': total_marks,
+                    'percentage': pct,
+                    'conceptual_mistakes': _pattern_message("No strong patterns detected yet.", conceptual_patterns),
+                    'behavior_patterns': _pattern_message("No clear behavior patterns detected.", behavior_patterns),
+                })
+
+            for index, entry in enumerate(test_entries):
+                previous_entry = test_entries[index - 1] if index > 0 else None
+                entry['comparison'] = _build_comparison(entry, previous_entry)
+
+            avg_score = round(sum(scores) / len(scores)) if scores else 0
+            recent_score = scores[-1] if scores else 0
+            latest_test = test_entries[-1] if test_entries else None
+
+            subjects_data.append({
+                'name': subject,
+                'test_count': len(test_entries),
+                'avg_score': avg_score,
+                'recent_score': recent_score,
+                'conceptual_mistakes': latest_test['conceptual_mistakes'] if latest_test else ["No review available."],
+                'behavior_patterns': latest_test['behavior_patterns'] if latest_test else ["No review available."],
+                'tests': list(reversed(test_entries)),
+            })
+
+        subjects_data.sort(key=lambda item: item['test_count'], reverse=True)
+        return Response({'subjects': subjects_data})
+
 
 class SubjectListCreateView(generics.ListCreateAPIView):
     queryset = Subject.objects.all().order_by('name')
@@ -459,16 +528,24 @@ class UpcomingTestListCreateView(generics.ListCreateAPIView):
     serializer_class = UpcomingTestSerializer
 
     def get_queryset(self):
+        now = timezone.now()
+        UpcomingTest.objects.filter(status='scheduled', start_time__lte=now).update(status='active')
+        UpcomingTest.objects.exclude(status='finished').filter(end_time__isnull=False, end_time__lt=now).update(status='finished')
+
         queryset = UpcomingTest.objects.all()
         class_name = self.request.query_params.get('class_name')
+        assigned_class = self.request.query_params.get('assigned_class')
         student_id = self.request.query_params.get('student_id')
 
         if student_id:
             try:
                 student = Student.objects.get(pk=student_id)
-                queryset = queryset.filter(class_name=student.class_name)
+                queryset = queryset.filter(class_name=student.class_name, questions_generated=True)
             except Student.DoesNotExist:
                 return UpcomingTest.objects.none()
+        elif assigned_class and assigned_class != 'Class N/A':
+            # Filter by teacher's assigned class
+            queryset = queryset.filter(class_name=assigned_class)
         elif class_name:
             queryset = queryset.filter(class_name=class_name)
 
@@ -498,19 +575,1073 @@ class UpcomingTestListCreateView(generics.ListCreateAPIView):
                 },
             )
 
+    def list(self, request, *args, **kwargs):
+        response = super().list(request, *args, **kwargs)
+        student_id = request.query_params.get('student_id')
+
+        if not student_id:
+            return response
+
+        try:
+            sid = int(student_id)
+        except (TypeError, ValueError):
+            return response
+
+        payload = response.data if isinstance(response.data, list) else []
+        student = Student.objects.filter(pk=sid).first()
+        submitted_ids = set()
+        now = timezone.now()
+        if student:
+            test_ids = [row.get('id') for row in payload if row.get('id')]
+            test_map = {
+                test.id: test
+                for test in UpcomingTest.objects.filter(id__in=test_ids)
+            }
+
+            # Auto-finalize only ended tests that have not been submitted yet.
+            for test in test_map.values():
+                if test.end_time and test.end_time < now:
+                    _finalize_test_submission(test, student)
+
+            # Prefer exact linkage via TestAttempt/TestResult to avoid false matches
+            # when different tests share the same test_name/date.
+            if _table_exists('tracker_testattempt'):
+                submitted_ids.update(
+                    TestAttempt.objects.filter(student=student, test_id__in=test_ids)
+                    .values_list('test_id', flat=True)
+                )
+
+            if _table_exists('tracker_testresult'):
+                submitted_ids.update(
+                    TestResult.objects.filter(student=student, test_id__in=test_ids)
+                    .exclude(status='InProgress')
+                    .values_list('test_id', flat=True)
+                )
+
+            # Legacy fallback only when no test-linked submission tables are available.
+            if not _table_exists('tracker_testattempt') and not _table_exists('tracker_testresult'):
+                for tid, test in test_map.items():
+                    if _student_has_submitted_test(student, test):
+                        submitted_ids.add(tid)
+
+        for row in payload:
+            test_id = row.get('id')
+            already_submitted = test_id in submitted_ids
+            row['already_submitted'] = already_submitted
+            try:
+                start_dt = _coerce_aware_datetime(row.get('start_time'))
+            except Exception:
+                start_dt = None
+            try:
+                end_dt = _coerce_aware_datetime(row.get('end_time'))
+            except Exception:
+                end_dt = None
+
+            # Mandatory debug trace for time-window classification.
+            logger.warning(
+                'TEST_STATUS_DEBUG test_id=%s current_time=%s start_time=%s end_time=%s',
+                test_id,
+                now.isoformat(),
+                start_dt.isoformat() if start_dt else None,
+                end_dt.isoformat() if end_dt else None,
+            )
+
+            # Time-only classification rule:
+            # now < start => upcoming
+            # start <= now <= end => active
+            # now > end => past
+            if start_dt and now < start_dt:
+                time_status = 'scheduled'
+            elif start_dt and end_dt and start_dt <= now <= end_dt:
+                time_status = 'active'
+            elif end_dt and now > end_dt:
+                time_status = 'finished'
+            elif start_dt and now >= start_dt:
+                time_status = 'active'
+            else:
+                time_status = 'scheduled'
+
+            has_started = bool(start_dt and now >= start_dt)
+            has_ended = bool(end_dt and now > end_dt)
+
+            row['status'] = 'finished' if already_submitted else time_status
+
+            row['is_available_now'] = bool(has_started and not has_ended and not already_submitted)
+            row['is_past'] = bool(already_submitted or has_ended)
+            row['is_upcoming'] = bool(not row['is_past'])
+            row['workflow_status'] = _workflow_status(type('T', (), {
+                'status': row.get('status'),
+                'questions_generated': row.get('questions_generated', False),
+            })())
+
+        return response
+
 
 class UpcomingTestRetrieveUpdateDestroyView(generics.RetrieveUpdateDestroyAPIView):
     queryset = UpcomingTest.objects.all()
     serializer_class = UpcomingTestSerializer
 
-    def destroy(self, request, *args, **kwargs):
+    def get_object(self):
+        instance = super().get_object()
+        if instance.status == 'scheduled' and instance.start_time and instance.start_time <= timezone.now():
+            instance.status = 'active'
+            instance.save(update_fields=['status'])
+        if instance.status != 'finished' and instance.end_time and instance.end_time < timezone.now():
+            instance.status = 'finished'
+            instance.save(update_fields=['status'])
+        return instance
+
+    def update(self, request, *args, **kwargs):
         instance = self.get_object()
         if instance.status != 'scheduled':
             return Response(
-                {'error': 'Only scheduled tests can be deleted.'},
+                {'error': 'Test cannot be modified once it becomes active.'},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        return super().update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        # Edge-case testing mode: allow deleting tests from DB regardless of status.
+        self.get_object()
         return super().destroy(request, *args, **kwargs)
+
+
+class TeacherQuestionsReviewView(APIView):
+    """
+    GET /api/upcoming-tests/<id>/teacher-questions-review/
+
+    Returns the manually authored MCQ set saved for a scheduled test.
+    """
+
+    def get(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+        teacher_id = request.query_params.get('teacher_id')
+
+        # Optional access control if test is teacher-bound.
+        if test.teacher_id and teacher_id and str(test.teacher_id) != str(teacher_id):
+            return Response({'error': 'You are not authorized to view this test.'}, status=status.HTTP_403_FORBIDDEN)
+
+        questions = test.question_bank if isinstance(test.question_bank, list) else []
+        return Response({
+            'test_id': test.id,
+            'test_name': test.test_name,
+            'questions': questions,
+            'num_questions': test.num_questions,
+            'total_marks': test.total_marks,
+            'workflow_status': _workflow_status(test),
+            'is_published': bool(test.questions_generated),
+            'is_editable': (not test.questions_generated) and test.status == 'scheduled',
+        }, status=status.HTTP_200_OK)
+
+
+class DraftTeacherQuestionsView(APIView):
+    """
+    POST /api/upcoming-tests/<id>/draft-questions/
+
+    Saves draft questions without publishing to students.
+    """
+
+    def post(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+
+        if test.status != 'scheduled':
+            return Response({'error': 'Draft can only be updated before test starts.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if test.questions_generated:
+            return Response({'error': 'This test is already published. Draft edits are locked.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        teacher_id = request.data.get('teacher_id')
+        questions = request.data.get('questions', [])
+
+        if test.teacher_id and teacher_id and str(test.teacher_id) != str(teacher_id):
+            return Response({'error': 'You are not authorized to update this test.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if not isinstance(questions, list) or not questions:
+            return Response({'error': 'At least one question is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        cleaned = []
+        for idx, row in enumerate(questions, start=1):
+            q_text = str(row.get('question_text', '')).strip()
+            options = row.get('options') or {}
+            correct = str(row.get('correct_answer', '')).strip()
+            topic = str(row.get('topic', test.subject or test.topic or 'General')).strip()
+            difficulty = str(row.get('difficulty', 'Medium')).strip() or 'Medium'
+
+            if not q_text:
+                return Response({'error': f'Question {idx}: question_text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+            if not isinstance(options, dict) or len(options) < 2:
+                return Response({'error': f'Question {idx}: at least 2 options are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            normalized_options = {}
+            for key, value in options.items():
+                k = str(key).strip()
+                v = str(value).strip()
+                if not k or not v:
+                    return Response({'error': f'Question {idx}: option keys and values cannot be empty.'}, status=status.HTTP_400_BAD_REQUEST)
+                normalized_options[k] = v
+
+            if correct not in normalized_options:
+                return Response({'error': f'Question {idx}: correct_answer must match an option key.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            cleaned.append({
+                'question_text': q_text,
+                'question_type': 'MCQ',
+                'options': normalized_options,
+                'correct_answer': correct,
+                'marks': 1,
+                'topic': topic,
+                'difficulty': difficulty,
+            })
+
+        test.question_bank = cleaned
+        test.num_questions = len(cleaned)
+        test.total_marks = len(cleaned)
+        test.questions_generated = False
+        test.save(update_fields=['question_bank', 'num_questions', 'total_marks', 'questions_generated'])
+
+        return Response({'message': 'Draft saved successfully.', 'saved': len(cleaned)}, status=status.HTTP_200_OK)
+
+
+class PublishTeacherQuestionsView(APIView):
+    """
+    POST /api/upcoming-tests/<id>/publish-questions/
+
+    Body:
+    {
+      "teacher_id": 4,
+      "questions": [
+        {
+          "question_text": "...",
+          "question_type": "MCQ",
+          "options": {"A": "...", "B": "..."},
+          "correct_answer": "A",
+          "marks": 2
+        }
+      ]
+    }
+    """
+
+    def post(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+
+        if test.status == 'scheduled' and test.start_time and test.start_time <= timezone.now():
+            test.status = 'active'
+            test.save(update_fields=['status'])
+
+        if test.status != 'scheduled':
+            return Response(
+                {'error': 'Questions cannot be modified once test becomes active.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if test.questions_generated:
+            return Response({'error': 'Test is already published. Questions are locked.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        teacher_id = request.data.get('teacher_id')
+        questions = request.data.get('questions', [])
+
+        if test.teacher_id and teacher_id and str(test.teacher_id) != str(teacher_id):
+            return Response({'error': 'You are not authorized to update this test.'}, status=status.HTTP_403_FORBIDDEN)
+
+        if not isinstance(questions, list) or not questions:
+            return Response({'error': 'At least one question is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        cleaned = []
+
+        for idx, row in enumerate(questions, start=1):
+            q_text = str(row.get('question_text', '')).strip()
+            q_type = str(row.get('question_type', 'MCQ')).strip() or 'MCQ'
+            options = row.get('options') or {}
+            correct = str(row.get('correct_answer', '')).strip()
+            topic = str(row.get('topic', test.subject or test.topic or 'General')).strip() or (test.subject or test.topic or 'General')
+            difficulty = str(row.get('difficulty', 'medium')).strip().lower() or 'medium'
+
+            if not q_text:
+                return Response({'error': f'Question {idx}: question_text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if q_type != 'MCQ':
+                return Response({'error': f'Question {idx}: only MCQ questions are supported.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if not isinstance(options, dict) or len(options) < 2:
+                return Response({'error': f'Question {idx}: at least 2 options are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            normalized_options = {}
+            for key, value in options.items():
+                k = str(key).strip()
+                v = str(value).strip()
+                if not k or not v:
+                    return Response({'error': f'Question {idx}: option keys and values cannot be empty.'}, status=status.HTTP_400_BAD_REQUEST)
+                normalized_options[k] = v
+
+            if correct not in normalized_options:
+                return Response({'error': f'Question {idx}: correct_answer must match an option key.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            if difficulty not in ('easy', 'medium', 'hard'):
+                return Response({'error': f'Question {idx}: difficulty must be easy, medium, or hard.'}, status=status.HTTP_400_BAD_REQUEST)
+
+            cleaned.append({
+                'question_text': q_text,
+                'question_type': 'MCQ',
+                'options': normalized_options,
+                'correct_answer': correct,
+                'marks': 1,
+                'topic': topic,
+                'difficulty': difficulty,
+            })
+
+        test.question_bank = cleaned
+        test.num_questions = len(cleaned)
+        test.total_marks = len(cleaned)
+        test.questions_generated = True
+        test.save(update_fields=['question_bank', 'num_questions', 'total_marks', 'questions_generated'])
+
+        return Response(
+            {
+                'message': 'Questions published successfully.',
+                'saved': len(cleaned),
+                'num_questions': test.num_questions,
+                'total_marks': test.total_marks,
+                'workflow_status': 'Published',
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+def _coerce_question_bank(test):
+    bank = test.question_bank if isinstance(test.question_bank, list) else []
+    cleaned = []
+    for idx, row in enumerate(bank, start=1):
+        options = row.get('options') if isinstance(row, dict) else {}
+        if not isinstance(options, dict):
+            options = {}
+        cleaned.append({
+            'id': idx,
+            'question_text': str(row.get('question_text', '')).strip() if isinstance(row, dict) else '',
+            'question_type': 'MCQ',
+            'options': options,
+            'correct_answer': str(row.get('correct_answer', '')).strip() if isinstance(row, dict) else '',
+            'marks': 1,
+            'topic': str(row.get('topic', test.subject or test.topic or 'General')).strip() if isinstance(row, dict) else (test.subject or test.topic or 'General'),
+            'difficulty': str(row.get('difficulty', 'Medium')).strip() if isinstance(row, dict) else 'Medium',
+        })
+    return cleaned
+
+
+def _runtime_cache_key(student_id, test_id):
+    return f"runtime_answers:{student_id}:{test_id}"
+
+
+def _table_columns(table_name):
+    """Get column names for a table (database-agnostic)."""
+    try:
+        from django.db import connection
+        inspector = connection.introspection
+        cursor = connection.cursor()
+        
+        # Check if table exists
+        tables = [t[0] for t in inspector.get_table_list(cursor)]
+        if table_name not in tables:
+            return set()
+        
+        # Get field information
+        field_info = inspector.get_columns(cursor, table_name)
+        return {field[0] for field in field_info}
+    except Exception:
+        return set()
+
+
+def _table_exists(table_name):
+    return bool(_table_columns(table_name))
+
+
+def _persisted_answers_map(student, test):
+    answers_map = {}
+    columns = _table_columns('tracker_studenttestresponse')
+    if not columns:
+        return answers_map
+
+    try:
+        with connection.cursor() as cursor:
+            if {'selected_answer', 'time_taken_seconds', 'answer_changed', 'question_id'}.issubset(columns):
+                cursor.execute(
+                    """
+                    SELECT question_id, COALESCE(selected_answer, ''), COALESCE(time_taken_seconds, 0), COALESCE(answer_changed, 0)
+                    FROM tracker_studenttestresponse
+                    WHERE student_id = %s AND test_id = %s
+                    ORDER BY question_id
+                    """,
+                    [student.id, test.id],
+                )
+                rows = cursor.fetchall()
+                for row in rows:
+                    if not row or len(row) < 4:
+                        continue
+                    answers_map[str(int(row[0]))] = {
+                        'answer': str(row[1] or '').strip(),
+                        'time_taken_seconds': max(0, int(row[2] or 0)),
+                        'answer_changed': bool(row[3]),
+                    }
+            elif {'student_answer', 'response_time', 'question_id'}.issubset(columns):
+                cursor.execute(
+                    """
+                    SELECT COALESCE(student_answer, ''), COALESCE(response_time, 0)
+                    FROM tracker_studenttestresponse
+                    WHERE student_id = %s AND test_id = %s
+                    ORDER BY question_id, id
+                    """,
+                    [student.id, test.id],
+                )
+                rows = cursor.fetchall()
+                for idx, row in enumerate(rows, start=1):
+                    if not row or len(row) < 2:
+                        continue
+                    answers_map[str(idx)] = {
+                        'answer': str(row[0] or '').strip(),
+                        'time_taken_seconds': max(0, int(row[1] or 0)),
+                        'answer_changed': False,
+                    }
+    except Exception:
+        return {}
+
+    return answers_map
+
+
+def _attempt_answers_map(student, test):
+    if not _table_exists('tracker_testattempt'):
+        return {}
+    attempt = TestAttempt.objects.filter(student=student, test=test).order_by('-updated_at').first()
+    if not attempt:
+        return {}
+
+    payload = attempt.answers_payload if isinstance(attempt.answers_payload, list) else []
+    answers_map = {}
+    for row in payload:
+        if not isinstance(row, dict):
+            continue
+        qid = row.get('question_id')
+        if qid is None or qid == '':
+            continue
+        qid_str = str(qid)
+        answers_map[qid_str] = {
+            'answer': str(row.get('selected_answer', '') or '').strip(),
+            'time_taken_seconds': max(0, int(row.get('time_taken_seconds', 0) or 0)),
+            'answer_changed': bool(row.get('answer_changed', False)),
+        }
+    return answers_map
+
+
+def _resolved_answers_map(student, test):
+    runtime = cache.get(_runtime_cache_key(student.id, test.id), {})
+    if isinstance(runtime, dict) and runtime:
+        return runtime
+    attempt_answers = _attempt_answers_map(student, test)
+    if attempt_answers:
+        return attempt_answers
+    return _persisted_answers_map(student, test)
+
+
+def _question_level_rows(test, student):
+    question_bank = _coerce_question_bank(test)
+    answers_map = _resolved_answers_map(student, test)
+    rows = []
+
+    for question in question_bank:
+        question_id = int(question['id'])
+        entry = answers_map.get(str(question_id), {}) if isinstance(answers_map, dict) else {}
+        selected_answer = str(entry.get('answer', '') or '').strip()
+        try:
+            time_taken_seconds = max(0, int(entry.get('time_taken_seconds', 0) or 0))
+        except (TypeError, ValueError):
+            time_taken_seconds = 0
+
+        rows.append({
+            'question_id': question_id,
+            'question_text': question.get('question_text', ''),
+            'selected_answer': selected_answer,
+            'correct_answer': str(question.get('correct_answer', '') or '').strip(),
+            'topic': question.get('topic', '') or 'General',
+            'is_correct': bool(selected_answer) and selected_answer == str(question.get('correct_answer', '') or '').strip(),
+            'time_taken_seconds': time_taken_seconds,
+            'answer_changed': bool(entry.get('answer_changed', False)),
+            'difficulty': str(question.get('difficulty', 'medium') or 'medium').lower(),
+            'options': question.get('options', {}),
+        })
+
+    return rows
+
+
+def _attempt_summary(student, test):
+    if not _table_exists('tracker_testattempt'):
+        return None
+    return TestAttempt.objects.filter(student=student, test=test).order_by('-updated_at').first()
+
+
+def _pattern_message(default_message, patterns):
+    if isinstance(patterns, list) and patterns:
+        return patterns
+    return [default_message]
+
+
+def _build_comparison(current_entry, previous_entry):
+    if not previous_entry:
+        return {
+            'status': 'first_test',
+            'title': 'First recorded test',
+            'summary': 'This is the first recorded test in this subject, so comparison will appear after the next test.',
+            'previous_test_name': None,
+            'previous_test_date': None,
+            'previous_score': None,
+            'score_change': None,
+        }
+
+    score_change = int(current_entry['percentage']) - int(previous_entry['percentage'])
+    if score_change > 0:
+        title = 'Improved from previous test'
+        summary = f"You improved compared with {previous_entry['test_name']}."
+        status = 'improved'
+    elif score_change < 0:
+        title = 'Dropped from previous test'
+        summary = f"Your performance dropped compared with {previous_entry['test_name']}."
+        status = 'declined'
+    else:
+        title = 'Similar to previous test'
+        summary = f"Your performance stayed at a similar level compared with {previous_entry['test_name']}."
+        status = 'stable'
+
+    return {
+        'status': status,
+        'title': title,
+        'summary': summary,
+        'previous_test_name': previous_entry['test_name'],
+        'previous_test_date': previous_entry['test_date'],
+        'previous_score': previous_entry['percentage'],
+        'score_change': score_change,
+    }
+
+
+def _legacy_attempt_defaults(student, test, mark, question_rows, conceptual_patterns, behavior_patterns):
+    correct_count = sum(1 for row in question_rows if row.get('is_correct'))
+    attempted_count = sum(1 for row in question_rows if row.get('selected_answer'))
+    unattempted_count = max(0, len(question_rows) - attempted_count)
+    accuracy = round((correct_count / attempted_count) * 100, 2) if attempted_count else 0
+    attempt_rate = round((attempted_count / len(question_rows)) * 100, 2) if question_rows else 0
+    time_taken_seconds = sum(int(row.get('time_taken_seconds', 0) or 0) for row in question_rows)
+
+    return {
+        'answers_payload': question_rows,
+        'conceptual_patterns': conceptual_patterns,
+        'behavior_patterns': behavior_patterns,
+        'score': float(mark.marks_obtained or 0),
+        'total_marks': float(mark.total_marks or 0),
+        'correct_count': correct_count,
+        'incorrect_count': max(0, attempted_count - correct_count),
+        'unattempted_count': unattempted_count,
+        'attempted_count': attempted_count,
+        'accuracy': accuracy,
+        'attempt_rate': attempt_rate,
+        'time_taken_seconds': time_taken_seconds,
+    }
+
+
+def _compute_response_stats(test, student, answers_map=None):
+    question_bank = _coerce_question_bank(test)
+    total_questions = len(question_bank)
+    total_marks = total_questions if total_questions else int(test.total_marks or 0)
+
+    runtime = answers_map if isinstance(answers_map, dict) else cache.get(_runtime_cache_key(student.id, test.id), {})
+
+    correct_count = 0
+    attempted_count = 0
+    time_taken_seconds = 0
+
+    for idx, q in enumerate(question_bank, start=1):
+        entry = runtime.get(str(idx), {}) if isinstance(runtime, dict) else {}
+        ans = str(entry.get('answer', '')).strip()
+        if ans:
+            attempted_count += 1
+            if ans == str(q.get('correct_answer', '')).strip():
+                correct_count += 1
+        try:
+            time_taken_seconds += max(0, int(entry.get('time_taken_seconds', 0) or 0))
+        except (TypeError, ValueError):
+            pass
+
+    incorrect_count = max(0, attempted_count - correct_count)
+    unattempted_count = max(0, total_questions - attempted_count)
+    score = float(correct_count)
+    accuracy = round((correct_count / attempted_count) * 100, 2) if attempted_count else 0
+    attempt_rate = round((attempted_count / total_questions) * 100, 2) if total_questions else 0
+
+    topic_wise = {}
+    for q in question_bank:
+        topic = q.get('topic') or 'General'
+        if topic not in topic_wise:
+            topic_wise[topic] = {'total': 0, 'correct': 0}
+        topic_wise[topic]['total'] += 1
+
+    for idx, q in enumerate(question_bank, start=1):
+        entry = runtime.get(str(idx), {}) if isinstance(runtime, dict) else {}
+        ans = str(entry.get('answer', '')).strip()
+        topic = q.get('topic') or 'General'
+        if ans and ans == str(q.get('correct_answer', '')).strip():
+            if topic not in topic_wise:
+                topic_wise[topic] = {'total': 0, 'correct': 0}
+            topic_wise[topic]['correct'] += 1
+
+    topic_wise_analysis = {}
+    for topic, stats in topic_wise.items():
+        total = int(stats.get('total', 0))
+        corr = int(stats.get('correct', 0))
+        pct = round((corr / total) * 100, 2) if total else 0
+        topic_wise_analysis[topic] = {'total': total, 'correct': corr, 'percentage': pct}
+
+    return {
+        'total_questions': total_questions,
+        'total_marks': total_marks,
+        'score': score,
+        'correct_count': correct_count,
+        'incorrect_count': incorrect_count,
+        'unattempted_count': unattempted_count,
+        'attempted_count': attempted_count,
+        'accuracy': accuracy,
+        'attempt_rate': attempt_rate,
+        'time_taken_seconds': time_taken_seconds,
+        'topic_wise_analysis': topic_wise_analysis,
+    }
+
+
+def _finalize_test_submission(test, student, runtime=None):
+    key = _runtime_cache_key(student.id, test.id)
+    payload = runtime if isinstance(runtime, dict) else cache.get(key, {})
+    if not isinstance(payload, dict) or not payload:
+        return None
+
+    cache.set(key, payload, timeout=60 * 60 * 6)
+
+    stats = _compute_response_stats(test, student, payload)
+    question_rows = _question_level_rows(test, student)
+    conceptual_patterns = analyze_conceptual_mistakes(question_rows) if question_rows else ["No review available."]
+    behavior_patterns = analyze_test_behavior(question_rows) if question_rows else ["No review available."]
+
+    question_bank = _coerce_question_bank(test)
+    for question in question_bank:
+        question_id = int(question['id'])
+        entry = payload.get(str(question_id), {}) if isinstance(payload, dict) else {}
+        selected_answer = str(entry.get('answer', '') or '').strip()
+        try:
+            time_taken_seconds = max(0, int(entry.get('time_taken_seconds', 0) or 0))
+        except (TypeError, ValueError):
+            time_taken_seconds = 0
+        answer_changed = bool(entry.get('answer_changed', False))
+        correct_answer = str(question.get('correct_answer', '') or '').strip()
+        is_correct = bool(selected_answer) and selected_answer == correct_answer
+
+        try:
+            StudentTestResponse.objects.update_or_create(
+                student=student,
+                test=test,
+                question_id=question_id,
+                defaults={
+                    'question_text': question.get('question_text', ''),
+                    'selected_answer': selected_answer,
+                    'correct_answer': correct_answer,
+                    'is_correct': is_correct,
+                    'answer_changed': answer_changed,
+                    'question_difficulty': str(question.get('difficulty', 'Medium') or 'Medium'),
+                    'topic': str(question.get('topic', 'General') or 'General'),
+                    'time_taken_seconds': time_taken_seconds,
+                    'marks_awarded': 1.0 if is_correct else 0.0,
+                },
+            )
+        except Exception:
+            pass
+
+    if _table_exists('tracker_testattempt'):
+        TestAttempt.objects.update_or_create(
+            student=student,
+            test=test,
+            defaults={
+                'answers_payload': question_rows,
+                'conceptual_patterns': conceptual_patterns,
+                'behavior_patterns': behavior_patterns,
+                'score': stats['score'],
+                'total_marks': stats['total_marks'],
+                'correct_count': stats['correct_count'],
+                'incorrect_count': stats['incorrect_count'],
+                'unattempted_count': stats['unattempted_count'],
+                'attempted_count': stats['attempted_count'],
+                'accuracy': stats['accuracy'],
+                'attempt_rate': stats['attempt_rate'],
+                'time_taken_seconds': stats['time_taken_seconds'],
+            },
+        )
+
+    try:
+        TestResult.objects.update_or_create(
+            student=student,
+            test=test,
+            defaults={
+                'total_score': stats['score'],
+                'total_marks': stats['total_marks'],
+                'percentage': round((stats['score'] / stats['total_marks']) * 100, 2) if stats['total_marks'] else 0,
+                'status': 'Completed',
+                'topic_wise_analysis': stats['topic_wise_analysis'],
+                'strengths': [],
+                'weaknesses': [],
+                'recommendations': '',
+                'predicted_performance': {},
+            },
+        )
+    except Exception:
+        pass
+
+    subject_label = _subject_label(test.subject or test.topic or 'General')
+    candidate_marks = TestMark.objects.filter(
+        student=student,
+        test_name=test.test_name,
+        date_taken=test.test_date,
+    ).order_by('-id')
+    test_mark = next(
+        (mark for mark in candidate_marks if _normalize_subject(mark.subject) == _normalize_subject(subject_label)),
+        None,
+    )
+
+    if test_mark:
+        test_mark.subject = subject_label
+        test_mark.marks_obtained = stats['score']
+        test_mark.total_marks = stats['total_questions'] or test.total_marks
+        test_mark.save(update_fields=['subject', 'marks_obtained', 'total_marks'])
+        created_mark = False
+    else:
+        test_mark = TestMark.objects.create(
+            student=student,
+            subject=subject_label,
+            test_name=test.test_name,
+            marks_obtained=stats['score'],
+            total_marks=stats['total_questions'] or test.total_marks,
+            date_taken=test.test_date,
+        )
+        created_mark = True
+
+    logger.warning(
+        'TEST_MARK_UPSERT_DEBUG student_id=%s test_id=%s subject=%s test_name=%s date=%s mark_id=%s created=%s',
+        student.id,
+        test.id,
+        _normalize_subject(subject_label),
+        ' '.join(str(test.test_name or '').strip().lower().split()),
+        str(test.test_date),
+        test_mark.id,
+        created_mark,
+    )
+
+    _run_performance_analysis(test_mark)
+    return stats
+
+
+class StudentTestDetailsView(APIView):
+    def get(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+
+        now = timezone.now()
+        if test.status != 'finished' and test.end_time and test.end_time < now:
+            test.status = 'finished'
+            test.save(update_fields=['status'])
+
+        student_id = request.query_params.get('student_id')
+        student = Student.objects.filter(pk=student_id).first() if student_id else None
+        if student and test.end_time and test.end_time < now:
+            _finalize_test_submission(test, student)
+
+        start_time = test.start_time
+        end_time = test.end_time
+        already_submitted = bool(student and _student_has_submitted_test(student, test))
+        in_window = bool(start_time and end_time and start_time <= now <= end_time)
+
+        study_material_url = test.study_material.url if test.study_material else None
+        return Response({
+            'id': test.id,
+            'test_name': test.test_name,
+            'subject': test.subject,
+            'topic': test.topic,
+            'test_date': test.test_date,
+            'start_time': start_time,
+            'end_time': end_time,
+            'num_questions': test.num_questions,
+            'total_marks': test.total_marks,
+            'class_name': test.class_name,
+            'status': test.status,
+            'workflow_status': _workflow_status(test),
+            'study_material_url': study_material_url,
+            'already_submitted': already_submitted,
+            'student_can_submit': (not already_submitted) and in_window,
+        }, status=status.HTTP_200_OK)
+
+
+class StudentTestQuestionsView(APIView):
+    def get(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+        question_bank = _coerce_question_bank(test)
+        if not question_bank:
+            return Response({'error': 'No questions available for this test yet.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        safe_questions = []
+        for q in question_bank:
+            safe_questions.append({
+                'id': q['id'],
+                'question_text': q['question_text'],
+                'question_type': q['question_type'],
+                'options': q['options'],
+                'marks': q['marks'],
+                'topic': q['topic'],
+                'difficulty': q['difficulty'],
+            })
+
+        return Response({'questions': safe_questions}, status=status.HTTP_200_OK)
+
+
+class StudentTestReviewView(APIView):
+    def get(self, request, pk):
+        student_id = request.query_params.get('student_id')
+        if not student_id:
+            return Response({'error': 'student_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        test = get_object_or_404(UpcomingTest, pk=pk)
+        student = get_object_or_404(Student, pk=student_id)
+        review_rows = _question_level_rows(test, student)
+        answers_map = _resolved_answers_map(student, test)
+        attempt = _attempt_summary(student, test)
+        stats = _compute_response_stats(test, student, answers_map if answers_map else None)
+        if attempt:
+            stats.update({
+                'score': float(attempt.score or 0),
+                'total_marks': float(attempt.total_marks or 0),
+                'correct_count': int(attempt.correct_count or 0),
+                'incorrect_count': int(attempt.incorrect_count or 0),
+                'unattempted_count': int(attempt.unattempted_count or 0),
+                'attempted_count': int(attempt.attempted_count or 0),
+                'accuracy': float(attempt.accuracy or 0),
+                'attempt_rate': float(attempt.attempt_rate or 0),
+                'time_taken_seconds': int(attempt.time_taken_seconds or 0),
+            })
+        percentage = round((stats['score'] / stats['total_marks']) * 100, 2) if stats['total_marks'] else 0
+
+        return Response({
+            'test_id': test.id,
+            'test_name': test.test_name,
+            'subject': test.subject or test.topic or 'General',
+            'test_date': test.test_date,
+            'score': stats['score'],
+            'total_marks': stats['total_marks'],
+            'percentage': percentage,
+            'accuracy': stats['accuracy'],
+            'attempt_rate': stats['attempt_rate'],
+            'correct': stats['correct_count'],
+            'incorrect': stats['incorrect_count'],
+            'unattempted': stats['unattempted_count'],
+            'time_taken_seconds': stats['time_taken_seconds'],
+            'questions': [
+                {
+                    **row,
+                    'is_attempted': bool(row.get('selected_answer')),
+                }
+                for row in review_rows
+            ],
+        }, status=status.HTTP_200_OK)
+
+
+class StudentSingleResponseView(APIView):
+    def post(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+        student_id = request.data.get('student_id')
+        question_id = request.data.get('question_id')
+        answer = str(request.data.get('answer', '')).strip()
+        time_taken_seconds = request.data.get('time_taken_seconds', 0)
+        answer_changed = bool(request.data.get('answer_changed', False))
+
+        if not student_id or not question_id:
+            return Response({'error': 'student_id and question_id are required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        student = get_object_or_404(Student, pk=student_id)
+        try:
+            question_id = int(question_id)
+        except (TypeError, ValueError):
+            return Response({'error': 'question_id must be numeric.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        bank = _coerce_question_bank(test)
+        if question_id <= 0 or question_id > len(bank):
+            return Response({'error': 'Invalid question_id.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        try:
+            time_taken_seconds = max(0, int(time_taken_seconds or 0))
+        except (TypeError, ValueError):
+            time_taken_seconds = 0
+
+        key = _runtime_cache_key(student.id, test.id)
+        runtime = cache.get(key, {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+
+        prior = runtime.get(str(question_id), {})
+        if prior and str(prior.get('answer', '')).strip() and str(prior.get('answer', '')).strip() != answer:
+            answer_changed = True
+
+        runtime[str(question_id)] = {
+            'answer': answer,
+            'time_taken_seconds': time_taken_seconds,
+            'answer_changed': bool(answer_changed),
+        }
+        cache.set(key, runtime, timeout=60 * 60 * 6)
+
+        return Response({
+            'saved': True,
+        }, status=status.HTTP_200_OK)
+
+
+class StudentSubmitTestView(APIView):
+    def post(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+        student_id = request.data.get('student_id')
+        responses = request.data.get('responses', [])
+
+        if not student_id:
+            return Response({'error': 'student_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        student = get_object_or_404(Student, pk=student_id)
+
+        key = _runtime_cache_key(student.id, test.id)
+        runtime = cache.get(key, {})
+        if not isinstance(runtime, dict):
+            runtime = {}
+
+        if isinstance(responses, list):
+            for row in responses:
+                qid = row.get('question_id')
+                if not qid:
+                    continue
+                try:
+                    qid_int = int(qid)
+                except (TypeError, ValueError):
+                    continue
+                ans = str(row.get('answer', '') or '').strip()
+                try:
+                    tts = max(0, int(row.get('time_taken_seconds', 0) or 0))
+                except (TypeError, ValueError):
+                    tts = 0
+                runtime[str(qid_int)] = {
+                    'answer': ans,
+                    'time_taken_seconds': tts,
+                    'answer_changed': bool(row.get('answer_changed', False)),
+                }
+
+        stats = _finalize_test_submission(test, student, runtime)
+        if not stats:
+            return Response({'error': 'No responses available to submit.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        return Response({
+            'score': stats['score'],
+            'total_marks': stats['total_marks'],
+            'accuracy': stats['accuracy'],
+            'attempt_rate': stats['attempt_rate'],
+            'correct': stats['correct_count'],
+            'incorrect': stats['incorrect_count'],
+            'unattempted': stats['unattempted_count'],
+            'time_taken_seconds': stats['time_taken_seconds'],
+            'status': 'Completed',
+        }, status=status.HTTP_200_OK)
+
+
+class StudentTestResultView(APIView):
+    def get(self, request, pk):
+        student_id = request.query_params.get('student_id')
+        if not student_id:
+            return Response({'error': 'student_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        test = get_object_or_404(UpcomingTest, pk=pk)
+        student = get_object_or_404(Student, pk=student_id)
+        if test.end_time and test.end_time < timezone.now():
+            _finalize_test_submission(test, student)
+        key = _runtime_cache_key(student.id, test.id)
+        runtime = cache.get(key, {})
+        attempt = _attempt_summary(student, test)
+
+        if isinstance(runtime, dict) and runtime:
+            stats = _compute_response_stats(test, student, runtime)
+        elif attempt:
+            stats = {
+                'score': float(attempt.score or 0),
+                'total_marks': float(attempt.total_marks or 0),
+                'accuracy': float(attempt.accuracy or 0),
+                'attempt_rate': float(attempt.attempt_rate or 0),
+                'correct_count': int(attempt.correct_count or 0),
+                'incorrect_count': int(attempt.incorrect_count or 0),
+                'unattempted_count': int(attempt.unattempted_count or 0),
+                'time_taken_seconds': int(attempt.time_taken_seconds or 0),
+            }
+        else:
+            persisted_answers = _persisted_answers_map(student, test)
+            if persisted_answers:
+                stats = _compute_response_stats(test, student, persisted_answers)
+                return Response({
+                    'score': stats['score'],
+                    'total_marks': stats['total_marks'],
+                    'accuracy': stats['accuracy'],
+                    'attempt_rate': stats['attempt_rate'],
+                    'correct': stats['correct_count'],
+                    'incorrect': stats['incorrect_count'],
+                    'unattempted': stats['unattempted_count'],
+                    'time_taken_seconds': stats['time_taken_seconds'],
+                    'status': 'Completed',
+                }, status=status.HTTP_200_OK)
+
+            expected_subject = _normalize_subject(test.subject or test.topic or 'General')
+            candidate_marks = list(
+                TestMark.objects.filter(
+                    student=student,
+                    test_name=test.test_name,
+                    date_taken=test.test_date,
+                ).order_by('-id')
+            )
+            mark = next(
+                (m for m in candidate_marks if _normalize_subject(m.subject) == expected_subject),
+                candidate_marks[0] if candidate_marks else None,
+            )
+            logger.warning(
+                'TEST_RESULT_MARK_MATCH_DEBUG student_id=%s test_id=%s subject=%s test_name=%s date=%s candidates=%s selected_mark_id=%s',
+                student.id,
+                test.id,
+                expected_subject,
+                ' '.join(str(test.test_name or '').strip().lower().split()),
+                str(test.test_date),
+                len(candidate_marks),
+                mark.id if mark else None,
+            )
+            if not mark:
+                return Response({'error': 'Result not available yet.'}, status=status.HTTP_404_NOT_FOUND)
+            total_marks = int(mark.total_marks or 0)
+            score = float(mark.marks_obtained or 0)
+            accuracy = round((score / total_marks) * 100, 2) if total_marks else 0
+            stats = {
+                'score': score,
+                'total_marks': total_marks,
+                'accuracy': accuracy,
+                'attempt_rate': 0,
+                'correct_count': int(score),
+                'incorrect_count': max(0, total_marks - int(score)),
+                'unattempted_count': 0,
+                'time_taken_seconds': 0,
+            }
+
+        return Response({
+            'score': stats['score'],
+            'total_marks': stats['total_marks'],
+            'accuracy': stats['accuracy'],
+            'attempt_rate': stats['attempt_rate'],
+            'correct': stats['correct_count'],
+            'incorrect': stats['incorrect_count'],
+            'unattempted': stats['unattempted_count'],
+            'time_taken_seconds': stats['time_taken_seconds'],
+            'status': 'Completed',
+        }, status=status.HTTP_200_OK)
 
 
 class NotificationListView(generics.ListAPIView):
@@ -524,6 +1655,7 @@ class NotificationListView(generics.ListAPIView):
         notification_type = self.request.query_params.get('type')
         subject = self.request.query_params.get('subject')
         unread_only = self.request.query_params.get('unread')
+        assigned_class = self.request.query_params.get('assigned_class')
 
         if student_id:
             queryset = queryset.filter(student_id=student_id)
@@ -535,6 +1667,10 @@ class NotificationListView(generics.ListAPIView):
             queryset = queryset.filter(subject__iexact=subject.strip())
         if unread_only in {'1', 'true', 'yes'}:
             queryset = queryset.filter(read_status=False)
+        
+        # Filter by teacher's assigned class (show notifications from students in that class)
+        if assigned_class and assigned_class != 'Class N/A':
+            queryset = queryset.filter(student__class_name=assigned_class)
 
         return queryset
 
@@ -638,80 +1774,15 @@ class BulkMarkEntryView(APIView):
     Response: list of created TestMark ids.
     """
     def post(self, request):
-        test_id = request.data.get('test_id')
-        marks_data = request.data.get('marks', [])
-
-        if not test_id:
-            return Response({'error': 'test_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        if not marks_data:
-            return Response({'error': 'No marks provided.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        test = get_object_or_404(UpcomingTest, pk=test_id)
-
-        if test.status == 'finished':
-            return Response({'error': 'Marks for this test have already been submitted.'}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Collect all valid student IDs for this class
-        class_student_ids = set(
-            Student.objects.filter(class_name=test.class_name).values_list('id', flat=True)
+        return Response(
+            {
+                'error': (
+                    'Manual mark entry is disabled. Marks are automatically calculated '
+                    'from student MCQ submissions (1 mark per correct answer).'
+                )
+            },
+            status=status.HTTP_400_BAD_REQUEST,
         )
-
-        created = []
-        errors = []
-
-        for entry in marks_data:
-            student_id = entry.get('student_id')
-            marks_obtained = entry.get('marks_obtained')
-
-            # Skip rows where the teacher left the field blank
-            if marks_obtained is None or str(marks_obtained).strip() == '':
-                continue
-
-            # Security: only allow students from the test's class
-            if student_id not in class_student_ids:
-                errors.append({'student_id': student_id, 'error': 'Student does not belong to test class.'})
-                continue
-
-            try:
-                marks_obtained = float(marks_obtained)
-            except (TypeError, ValueError):
-                errors.append({'student_id': student_id, 'error': 'Invalid marks value.'})
-                continue
-
-            if marks_obtained < 0 or marks_obtained > test.total_marks:
-                errors.append({
-                    'student_id': student_id,
-                    'error': f'Marks must be between 0 and {test.total_marks}.',
-                })
-                continue
-
-            student = get_object_or_404(Student, pk=student_id)
-
-            mark = TestMark.objects.create(
-                student=student,
-                subject=test.subject or test.topic,
-                test_name=test.test_name,
-                marks_obtained=marks_obtained,
-                total_marks=test.total_marks,
-                date_taken=test.test_date,
-            )
-            _run_performance_analysis(mark)
-            created.append(mark.id)
-
-        if errors and not created:
-            return Response({'errors': errors}, status=status.HTTP_400_BAD_REQUEST)
-
-        # Mark the test as finished after all marks are saved
-        test.status = 'finished'
-        test.save(update_fields=['status'])
-
-        return Response({
-            'created': len(created),
-            'mark_ids': created,
-            'errors': errors,
-            'test_status': 'finished',
-        }, status=status.HTTP_201_CREATED)
 
 
 def _get_or_create_default_admin():
@@ -773,7 +1844,7 @@ def TeacherRegisterView(request):
     teacher_name = request.data.get('teacher_name', '').strip()
     username = request.data.get('username', '').strip().lower()
     password = request.data.get('password', '').strip()
-    department = request.data.get('department', '').strip()
+    assigned_class = request.data.get('assigned_class', '').strip()
 
     if not teacher_name or not username or not password:
         return Response({'error': 'Teacher name, username/email, and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
@@ -790,17 +1861,17 @@ def TeacherRegisterView(request):
 
     if existing and existing.status == 'rejected':
         existing.teacher_name = teacher_name
-        existing.department = department
+        existing.assigned_class = assigned_class
         existing.password = make_password(password)
         existing.status = 'pending'
-        existing.save(update_fields=['teacher_name', 'department', 'password', 'status', 'updated_at'])
+        existing.save(update_fields=['teacher_name', 'assigned_class', 'password', 'status', 'updated_at'])
         return Response({'message': 'Teacher account request submitted and is pending approval.', 'status': 'pending'}, status=status.HTTP_201_CREATED)
 
     TeacherCredential.objects.create(
         teacher_name=teacher_name,
         username=username,
         password=make_password(password),
-        department=department,
+        assigned_class=assigned_class,
         status='pending',
     )
     return Response({'message': 'Teacher account request submitted and is pending approval.', 'status': 'pending'}, status=status.HTTP_201_CREATED)
@@ -828,7 +1899,7 @@ def TeacherLoginView(request):
         'id': teacher.id,
         'username': teacher.username,
         'teacher_name': teacher.teacher_name,
-        'department': teacher.department,
+        'assigned_class': teacher.assigned_class,
         'role': 'teacher',
     }, status=status.HTTP_200_OK)
 
@@ -841,7 +1912,7 @@ def PendingTeacherListView(request):
             'teacher_id': row.id,
             'teacher_name': row.teacher_name,
             'username': row.username,
-            'department': row.department,
+            'assigned_class': row.assigned_class,
             'status': row.status,
         }
         for row in rows
@@ -857,7 +1928,7 @@ def ApprovedTeacherListView(request):
             'teacher_id': row.id,
             'teacher_name': row.teacher_name,
             'username': row.username,
-            'department': row.department,
+            'assigned_class': row.assigned_class,
             'status': row.status,
         }
         for row in rows

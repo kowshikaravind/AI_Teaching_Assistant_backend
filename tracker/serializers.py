@@ -1,18 +1,27 @@
 from rest_framework import serializers
 from django.contrib.auth.hashers import make_password
-from .models import Student, TestMark, Attendance, Subject, UpcomingTest, Notification
+from .models import Student, TestMark, TestQuestion, Subject, UpcomingTest, Notification
+
+
+class TestQuestionSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = TestQuestion
+        fields = ['id', 'question_text', 'question_type', 'options', 'correct_answer', 'difficulty', 'topic', 'marks', 'created_by', 'created_at']
 
 
 class TestMarkSerializer(serializers.ModelSerializer):
+    questions = serializers.SerializerMethodField()
+
+    def get_questions(self, obj):
+        try:
+            return TestQuestionSerializer(obj.questions.all(), many=True).data
+        except Exception:
+            # Keep student/testmark APIs functional even if legacy DB schema is out of sync.
+            return []
+
     class Meta:
         model = TestMark
-        fields = ['id', 'student', 'subject', 'test_name', 'marks_obtained', 'total_marks', 'date_taken']
-
-
-class AttendanceSerializer(serializers.ModelSerializer):
-    class Meta:
-        model = Attendance
-        fields = ['id', 'student', 'date', 'status']
+        fields = ['id', 'student', 'subject', 'test_name', 'marks_obtained', 'total_marks', 'date_taken', 'questions']
 
 
 class StudentSerializer(serializers.ModelSerializer):
@@ -75,7 +84,24 @@ class UpcomingTestSerializer(serializers.ModelSerializer):
 
     class Meta:
         model = UpcomingTest
-        fields = ['id', 'test_name', 'subject', 'topic', 'test_date', 'total_marks', 'class_name', 'status', 'created_at']
+        fields = [
+            'id',
+            'test_name',
+            'subject',
+            'topic',
+            'test_date',
+            'start_time',
+            'end_time',
+            'num_questions',
+            'study_material',
+            'questions_generated',
+            'question_bank',
+            'total_marks',
+            'class_name',
+            'teacher_id',
+            'status',
+            'created_at',
+        ]
 
 
 class NotificationSerializer(serializers.ModelSerializer):

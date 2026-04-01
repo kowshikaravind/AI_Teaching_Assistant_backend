@@ -1,4 +1,6 @@
-langchain-google-genai
-langchain
-pydantic
+django
+djangorestframework
+django-cors-headers
+djangorestframework-simplejwt
+google-generativeai
 python-dotenv

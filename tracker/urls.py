@@ -4,17 +4,23 @@ from .views import (
     StudentRetriveDestroyView,
     TestMarkListCreateView,
     TestMarkRetrieveDestroyView,
-    AttendanceBulkSaveView,
-    AttendanceSummaryView,
-    AttendanceByDateView,
     StudentChatView,
-    ClassChatView,
+    StudentAITutorView,
     SubjectListCreateView,
     SubjectDeleteView,
     StudentLoginView,
     StudentChangePasswordView,
     UpcomingTestListCreateView,
     UpcomingTestRetrieveUpdateDestroyView,
+    TeacherQuestionsReviewView,
+    DraftTeacherQuestionsView,
+    PublishTeacherQuestionsView,
+    StudentTestDetailsView,
+    StudentTestQuestionsView,
+    StudentTestReviewView,
+    StudentSingleResponseView,
+    StudentSubmitTestView,
+    StudentTestResultView,
     NotificationListView,
     NotificationMarkReadView,
     NotificationMarkAllReadView,
@@ -40,14 +46,10 @@ urlpatterns = [
     path('testmarks/<int:pk>/', TestMarkRetrieveDestroyView.as_view()),
     path('testmarks/bulk/', BulkMarkEntryView.as_view()),
 
-    # ── Attendance ────────────────────────────────────────────────
-    path('attendance/save/', AttendanceBulkSaveView.as_view()),
-    path('attendance/', AttendanceByDateView.as_view()),
-    path('students/<int:pk>/attendance-summary/', AttendanceSummaryView.as_view()),
 
     # ── AI Chat ───────────────────────────────────────────────────
     path('students/<int:pk>/chat/', StudentChatView.as_view()),
-    path('class-chat/', ClassChatView.as_view()),
+    path('students/<int:pk>/ai-tutor/', StudentAITutorView.as_view()),
 
     # ── Subjects ──────────────────────────────────────────────────
     path('subjects/', SubjectListCreateView.as_view()),
@@ -56,6 +58,15 @@ urlpatterns = [
     # ── Upcoming Tests ────────────────────────────────────────────
     path('upcoming-tests/', UpcomingTestListCreateView.as_view()),
     path('upcoming-tests/<int:pk>/', UpcomingTestRetrieveUpdateDestroyView.as_view()),
+    path('upcoming-tests/<int:pk>/teacher-questions-review/', TeacherQuestionsReviewView.as_view()),
+    path('upcoming-tests/<int:pk>/draft-questions/', DraftTeacherQuestionsView.as_view()),
+    path('upcoming-tests/<int:pk>/publish-questions/', PublishTeacherQuestionsView.as_view()),
+    path('upcoming-tests/<int:pk>/details/', StudentTestDetailsView.as_view()),
+    path('upcoming-tests/<int:pk>/questions/', StudentTestQuestionsView.as_view()),
+    path('upcoming-tests/<int:pk>/review/', StudentTestReviewView.as_view()),
+    path('upcoming-tests/<int:pk>/response/', StudentSingleResponseView.as_view()),
+    path('upcoming-tests/<int:pk>/submit/', StudentSubmitTestView.as_view()),
+    path('upcoming-tests/<int:pk>/results/', StudentTestResultView.as_view()),
 
     # ── Notifications ─────────────────────────────────────────────
     path('notifications/', NotificationListView.as_view()),

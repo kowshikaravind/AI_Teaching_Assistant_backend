@@ -35,23 +35,35 @@ class TestMark(models.Model):
         return f"{self.student.name} - {self.test_name}"
 
 
-class Attendance(models.Model):
-    STATUS_CHOICES = [
-        ('present', 'Present'),
-        ('absent', 'Absent'),
-        ('not_marked', 'Not Marked'),
+class TestQuestion(models.Model):
+    QUESTION_TYPE_CHOICES = [
+        ('MCQ', 'Multiple Choice'),
+        ('SHORT_ANSWER', 'Short Answer'),
+        ('TRUE_FALSE', 'True/False'),
+    ]
+    DIFFICULTY_CHOICES = [
+        ('Easy', 'Easy'),
+        ('Medium', 'Medium'),
+        ('Hard', 'Hard'),
     ]
 
-    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='attendance_records')
-    date = models.DateField()
-    status = models.CharField(max_length=15, choices=STATUS_CHOICES, default='not_marked')
+    test = models.ForeignKey('UpcomingTest', on_delete=models.CASCADE, related_name='questions')
+    question_text = models.TextField()
+    question_type = models.CharField(max_length=20, choices=QUESTION_TYPE_CHOICES, default='MCQ')
+    options = models.JSONField(blank=True, default=dict)
+    correct_answer = models.CharField(max_length=255)
+    difficulty = models.CharField(max_length=10, choices=DIFFICULTY_CHOICES, default='Medium')
+    topic = models.CharField(max_length=255, blank=True)
+    marks = models.PositiveIntegerField(default=1)
+    created_by = models.CharField(max_length=50, default='AI_GEMINI')
+    created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
-        # One record per student per date — no duplicates
-        unique_together = ('student', 'date')
+        ordering = ['test', 'created_at']
 
     def __str__(self):
-        return f"{self.student.name} - {self.date} - {self.status}"
+        return f"{self.test.test_name} - {self.question_text[:50]}"
+
 
 class Subject(models.Model):
     name = models.CharField(max_length=100, unique=True)
@@ -63,6 +75,7 @@ class Subject(models.Model):
 class UpcomingTest(models.Model):
     STATUS_CHOICES = [
         ('scheduled', 'Scheduled'),
+        ('active', 'Active'),
         ('finished', 'Finished'),
     ]
 
@@ -70,8 +83,15 @@ class UpcomingTest(models.Model):
     subject = models.CharField(max_length=120, default='General')
     topic = models.CharField(max_length=255, blank=True, default='')
     test_date = models.DateField()
+    start_time = models.DateTimeField(blank=True, null=True)
+    end_time = models.DateTimeField(blank=True, null=True)
+    num_questions = models.PositiveIntegerField(default=50)
+    study_material = models.FileField(upload_to='study_materials/', blank=True, null=True)
+    questions_generated = models.BooleanField(default=False)
+    question_bank = models.JSONField(blank=True, default=list)
     total_marks = models.PositiveIntegerField()
     class_name = models.CharField(max_length=50)
+    teacher_id = models.IntegerField(blank=True, null=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='scheduled')
     created_at = models.DateTimeField(auto_now_add=True)
 
@@ -80,6 +100,69 @@ class UpcomingTest(models.Model):
 
     def __str__(self):
         return f"{self.test_name} - {self.subject} ({self.class_name})"
+
+
+class StudentTestResponse(models.Model):
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='test_responses')
+    test = models.ForeignKey(UpcomingTest, on_delete=models.CASCADE, related_name='student_responses')
+    question = models.ForeignKey(TestQuestion, on_delete=models.CASCADE, related_name='student_answers')
+    student_answer = models.TextField()
+    is_correct = models.BooleanField(default=False)
+    marks_obtained = models.FloatField(default=0)
+    response_time = models.PositiveIntegerField(default=0)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['submitted_at']
+        unique_together = ('student', 'question', 'test')
+
+
+class TestResult(models.Model):
+    STATUS_CHOICES = [
+        ('Completed', 'Completed'),
+        ('Expired', 'Expired'),
+        ('InProgress', 'In Progress'),
+    ]
+
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='test_results')
+    test = models.ForeignKey(UpcomingTest, on_delete=models.CASCADE, related_name='results')
+    total_score = models.FloatField()
+    total_marks = models.FloatField()
+    percentage = models.FloatField()
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='InProgress')
+    topic_wise_analysis = models.JSONField(default=dict)
+    strengths = models.JSONField(default=list)
+    weaknesses = models.JSONField(default=list)
+    recommendations = models.TextField(blank=True)
+    predicted_performance = models.JSONField(default=dict)
+    completed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ['-completed_at']
+        unique_together = ('student', 'test')
+
+
+class TestAttempt(models.Model):
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='test_attempts')
+    test = models.ForeignKey(UpcomingTest, on_delete=models.CASCADE, related_name='test_attempts')
+    answers_payload = models.JSONField(blank=True, default=list)
+    conceptual_patterns = models.JSONField(blank=True, default=list)
+    behavior_patterns = models.JSONField(blank=True, default=list)
+    score = models.FloatField(default=0)
+    total_marks = models.FloatField(default=0)
+    correct_count = models.PositiveIntegerField(default=0)
+    incorrect_count = models.PositiveIntegerField(default=0)
+    unattempted_count = models.PositiveIntegerField(default=0)
+    attempted_count = models.PositiveIntegerField(default=0)
+    accuracy = models.FloatField(default=0)
+    attempt_rate = models.FloatField(default=0)
+    time_taken_seconds = models.PositiveIntegerField(default=0)
+    submitted_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        ordering = ['-updated_at']
+        unique_together = ('student', 'test')
 
 
 class Notification(models.Model):
@@ -134,7 +217,7 @@ class TeacherCredential(models.Model):
     teacher_name = models.CharField(max_length=120)
     username = models.CharField(max_length=120, unique=True)
     password = models.CharField(max_length=128)
-    department = models.CharField(max_length=120, blank=True, default='')
+    assigned_class = models.CharField(max_length=120, blank=True, default='')
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default='pending')
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)

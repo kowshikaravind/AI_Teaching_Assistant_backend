@@ -1,2 +1,19 @@
-.gitignore
 .env
+
+# Python cache and bytecode
+__pycache__/
+*.py[cod]
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Django local artifacts
+db.sqlite3
+media/
+study_materials/
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
