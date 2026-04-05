@@ -6,6 +6,7 @@ from .views import (
     TestMarkRetrieveDestroyView,
     StudentChatView,
     StudentAITutorView,
+    DeepAnswerScriptAnalysisView,
     SubjectListCreateView,
     SubjectDeleteView,
     StudentLoginView,
@@ -29,6 +30,7 @@ from .views import (
     AdminChangeCredentialsView,
     TeacherRegisterView,
     TeacherLoginView,
+    TeacherClassChatView,
     PendingTeacherListView,
     ApprovedTeacherListView,
     ApproveTeacherView,
@@ -50,6 +52,7 @@ urlpatterns = [
     # ── AI Chat ───────────────────────────────────────────────────
     path('students/<int:pk>/chat/', StudentChatView.as_view()),
     path('students/<int:pk>/ai-tutor/', StudentAITutorView.as_view()),
+    path('answer-script/deep-analysis/', DeepAnswerScriptAnalysisView.as_view()),
 
     # ── Subjects ──────────────────────────────────────────────────
     path('subjects/', SubjectListCreateView.as_view()),
@@ -82,6 +85,7 @@ urlpatterns = [
     path('admin-change-credentials/', AdminChangeCredentialsView),
     path('teacher-register/', TeacherRegisterView),
     path('teacher-login/', TeacherLoginView),
+    path('class-chat/', TeacherClassChatView),
     path('admin/teachers/pending/', PendingTeacherListView),
     path('admin/teachers/approved/', ApprovedTeacherListView),
     path('admin/teachers/<int:pk>/approve/', ApproveTeacherView),

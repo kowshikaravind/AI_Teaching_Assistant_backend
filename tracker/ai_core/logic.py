@@ -66,6 +66,54 @@ def _extract_bullets_only(text, max_items, empty_message):
     return _clean_pattern_list(bullets[:max_items], empty_message)
 
 
+def _looks_generic_concept_response(bullets):
+    generic_phrases = [
+        "narrow down the options",
+        "switch away from the correct line of thinking",
+        "familiar-looking options",
+        "some of the misses are on short, direct questions",
+        "underlying concept",
+        "what the question is actually asking",
+        "conceptual understanding",
+        "uncertainty in the underlying concept",
+        "same wrong idea",
+    ]
+    text = " ".join(str(item or "").lower() for item in bullets or [])
+    return any(phrase in text for phrase in generic_phrases)
+
+
+def _option_label(option_key, options):
+    if not isinstance(options, dict):
+        return str(option_key or "").strip()
+    label = str(options.get(str(option_key), "") or "").strip()
+    if label:
+        return f"{str(option_key).strip()} - {label}"
+    return str(option_key or "").strip()
+
+
+def _mcq_concept_frame(question):
+    options = question.get("options") or {}
+    selected = _normalize_text(question.get("selected_answer"))
+    correct = _normalize_text(question.get("correct_answer"))
+    question_text = _normalize_text(question.get("question_text"))
+
+    selected_text = _normalize_text(options.get(selected, "")) if isinstance(options, dict) else ""
+    correct_text = _normalize_text(options.get(correct, "")) if isinstance(options, dict) else ""
+
+    if selected and correct and (selected_text or correct_text):
+        return (
+            f"you chose option {selected}{f' ({selected_text})' if selected_text else ''}, "
+            f"but the correct choice is option {correct}{f' ({correct_text})' if correct_text else ''}"
+        )
+    if selected and correct:
+        return f"you chose option {selected}, but the correct choice is option {correct}"
+    if selected_text and correct_text:
+        return f"you chose '{selected_text}', but the correct choice is '{correct_text}'"
+    if question_text:
+        return f"this question asks: {question_text[:100]}"
+    return "the selected option does not match the concept tested by the question"
+
+
 def _behavior_summary(questions_data):
     timed_questions = []
     for question in questions_data or []:
@@ -117,13 +165,24 @@ def _heuristic_conceptual_mistakes(questions_data):
         return [NO_CONCEPT_PATTERN_MESSAGE]
 
     bullets = []
+    topic_buckets = {}
     same_answer_groups = {}
-    for question in incorrect:
+    mcq_rows = []
+    for index, question in enumerate(incorrect, start=1):
         selected = _normalize_text(question.get("selected_answer")).lower()
         correct = _normalize_text(question.get("correct_answer")).lower()
         topic = _normalize_topic(question.get("topic"))
         key = (selected, correct)
         same_answer_groups.setdefault(key, []).append(topic)
+        topic_buckets.setdefault(topic, []).append((index, question))
+        if str(question.get("question_type", "")).strip().upper() == "MCQ" or question.get("options"):
+            mcq_rows.append((index, question))
+
+    def _question_snippet(question):
+        text = _normalize_text(question.get("question_text"))
+        if not text:
+            return "this question"
+        return text if len(text) <= 90 else f"{text[:87]}..."
 
     repeated_choice_confusion = [
         (key, topics)
@@ -132,23 +191,77 @@ def _heuristic_conceptual_mistakes(questions_data):
     ]
     if repeated_choice_confusion:
         (selected, correct), topics = repeated_choice_confusion[0]
+        topic_label = _normalize_text(topics[0]) if topics else "these topics"
         bullets.append(
-            f"- In multiple questions, you are choosing '{selected}' when the logic points to '{correct}', which suggests you are applying the same wrong idea across similar situations."
+            f"- In multiple {topic_label} questions, you are choosing '{selected}' when the correct answer is '{correct}'. That points to one repeated misconception rather than random guessing."
         )
+
+    if mcq_rows:
+        option_insights = []
+        for index, question in mcq_rows[:4]:
+            frame = _mcq_concept_frame(question)
+            topic = _normalize_topic(question.get("topic"))
+            question_text = _normalize_text(question.get("question_text"))
+            prefix = f"Q{index} ({topic})"
+            if question_text:
+                prefix += f" - '{question_text[:70] + ('...' if len(question_text) > 70 else '')}'"
+            option_insights.append(f"{prefix}: {frame}")
+
+        if option_insights:
+            bullets.append(
+                "- Decision-making evidence from your MCQ choices: "
+                + "; ".join(option_insights[:2])
+                + "."
+            )
+            selected_examples = []
+            for index, question in mcq_rows[:3]:
+                selected = _normalize_text(question.get("selected_answer"))
+                correct = _normalize_text(question.get("correct_answer"))
+                options = question.get("options") or {}
+                selected_text = _normalize_text(options.get(selected, "")) if isinstance(options, dict) else ""
+                correct_text = _normalize_text(options.get(correct, "")) if isinstance(options, dict) else ""
+                if selected_text and correct_text:
+                    selected_examples.append(
+                        f"Q{index}: option {selected} ({selected_text}) vs option {correct} ({correct_text})"
+                    )
+                elif selected and correct:
+                    selected_examples.append(f"Q{index}: option {selected} vs option {correct}")
+
+            if selected_examples:
+                bullets.append(
+                    "- MCQ choice logic is the main issue here: "
+                    + "; ".join(selected_examples[:2])
+                    + ". That means the problem is not writing an answer, but deciding which option actually matches the concept."
+                )
+            first_index, first_question = mcq_rows[0]
+            first_topic = _normalize_topic(first_question.get("topic"))
+            first_question_text = _normalize_text(first_question.get("question_text"))
+            first_selected = _normalize_text(first_question.get("selected_answer"))
+            first_correct = _normalize_text(first_question.get("correct_answer"))
+            first_options = first_question.get("options") or {}
+            selected_text = _normalize_text(first_options.get(first_selected, "")) if isinstance(first_options, dict) else ""
+            correct_text = _normalize_text(first_options.get(first_correct, "")) if isinstance(first_options, dict) else ""
+            bullets.append(
+                f"- In Q{first_index} ({first_topic}), the question tests a specific condition, but your selected option {first_selected or '[blank]'}"
+                + (f" ({selected_text})" if selected_text else "")
+                + " aligns with a related idea, not the exact requirement. "
+                + f"The correct option {first_correct or '[blank]'}"
+                + (f" ({correct_text})" if correct_text else "")
+                + " is right because it directly satisfies that condition"
+                + (f" in '{first_question_text[:80] + ('...' if len(first_question_text) > 80 else '')}'" if first_question_text else "")
+                + "."
+            )
 
     changed_wrong = sum(1 for question in incorrect if question.get("answer_changed"))
     if changed_wrong >= 2:
+        changed_examples = [
+            f"Q{index} ({_normalize_topic(question.get('topic'))}) - '{_question_snippet(question)}'"
+            for index, question in enumerate(incorrect, start=1)
+            if question.get("answer_changed")
+        ][:2]
+        example_text = f" Examples: {'; '.join(changed_examples)}." if changed_examples else ""
         bullets.append(
-            "- In several wrong answers, you seem to narrow down the options but then switch away from the correct line of thinking, which shows uncertainty in the underlying concept."
-        )
-
-    short_question_confusion = [
-        question for question in incorrect
-        if len(_normalize_text(question.get("question_text")).split()) <= 12
-    ]
-    if len(short_question_confusion) >= 2:
-        bullets.append(
-            "- Even in shorter direct questions, your answers suggest you are relying on familiar-looking options instead of checking what the question is actually asking."
+            f"- You are changing answers after narrowing down choices, which shows hesitation rather than settled concept knowledge.{example_text}"
         )
 
     difficulty_wrong = {"easy": 0, "medium": 0, "hard": 0}
@@ -156,9 +269,32 @@ def _heuristic_conceptual_mistakes(questions_data):
         difficulty_wrong[_normalize_difficulty(question.get("difficulty"))] += 1
 
     if difficulty_wrong["easy"] >= 2:
+        easy_examples = [
+            f"Q{index} ({_normalize_topic(question.get('topic'))}) - '{_question_snippet(question)}'"
+            for index, question in enumerate(incorrect, start=1)
+            if _normalize_difficulty(question.get("difficulty")) == "easy"
+        ][:2]
+        example_text = f" Examples: {'; '.join(easy_examples)}." if easy_examples else ""
         bullets.append(
-            "- Some of these mistakes are happening on simpler questions too, which suggests the confusion is in the basic idea itself, not only in tougher applications."
+            f"- Some mistakes are happening on simpler questions too, so the issue looks conceptual and foundational rather than just exam pressure.{example_text}"
         )
+
+    if mcq_rows:
+        concept_pairs = []
+        for _, question in mcq_rows:
+            selected = _normalize_text(question.get("selected_answer"))
+            correct = _normalize_text(question.get("correct_answer"))
+            options = question.get("options") or {}
+            selected_text = _normalize_text(options.get(selected, "")) if isinstance(options, dict) else ""
+            correct_text = _normalize_text(options.get(correct, "")) if isinstance(options, dict) else ""
+            if selected and correct and selected != correct:
+                concept_pairs.append((selected_text or selected, correct_text or correct))
+
+        if concept_pairs:
+            sample_wrong, sample_right = concept_pairs[0]
+            bullets.append(
+                f"- Your MCQ pattern suggests you are mixing up {sample_wrong} with {sample_right}. The wrong option looks familiar, but the stem is testing the finer distinction between those two ideas."
+            )
 
     return _clean_pattern_list(bullets[:4], NO_CONCEPT_PATTERN_MESSAGE)
 
@@ -273,28 +409,21 @@ def analyze_conceptual_mistakes(questions_data):
 
 Your goal is NOT to summarize mistakes.
 Your goal is to deeply understand HOW the student is thinking wrong.
-
-You must behave like a human teacher reviewing an answer sheet.
-
 INPUT:
 You will receive incorrect responses with:
 - question_text
 - selected_answer
 - correct_answer
 - topic
-
-YOUR TASK:
-1. Carefully read each incorrect question.
-2. Understand what the student selected versus what is correct.
+- question_type
+- options when available
 3. Identify the thinking error behind the mistake.
 
-IMPORTANT:
-- Do not just group by topic.
-- Do not give generic patterns.
-- Do not repeat template-style outputs.
-- Do not mention scores, marks, percentages, statistics, or AI.
-- Do not give filler advice.
 - Only report a pattern if there is enough evidence across multiple incorrect answers.
+- Every bullet must reference the student's actual answer sheet evidence, such as a question theme, the selected answer, the correct answer, or a clear answer-change pattern.
+- For MCQs, analyze decision-making: explain why the selected option looked attractive, why the correct option is better, and what concept distinction was missed.
+- Do not write generic 'revise the topic' language for MCQs.
+- If options are provided, use them to explain the trap or misconception behind the wrong choice.
 
 You must:
 - Identify what the student misunderstood conceptually.
@@ -322,7 +451,9 @@ Incorrect answers:
         response = model.generate_content(prompt)
         result = getattr(response, "text", "").strip()
         parsed = _extract_bullets_only(result, 4, NO_CONCEPT_PATTERN_MESSAGE)
-        return parsed if parsed != [NO_CONCEPT_PATTERN_MESSAGE] else _heuristic_conceptual_mistakes(prepared)
+        if parsed != [NO_CONCEPT_PATTERN_MESSAGE] and not _looks_generic_concept_response(parsed):
+            return parsed
+        return _heuristic_conceptual_mistakes(prepared)
     except Exception:
         return _heuristic_conceptual_mistakes(prepared)
 
@@ -549,3 +680,417 @@ def fallback_student_chat_response(student_name, subject_name, subject_insights,
 
     lines.append(f"- Ask about a specific weak topic in {subject} if you want a more targeted explanation.")
     return "\n".join(lines)
+
+
+def comprehensive_answer_analysis(questions_data):
+    """Deep conceptual analysis for every test attempt using question-level evidence."""
+    if not questions_data or len(questions_data) < 3:
+        return "No deep conceptual pattern detected from current answer script."
+
+    prepared = []
+    for idx, question in enumerate(questions_data, start=1):
+        prepared.append({
+            "index": idx,
+            "topic": _normalize_topic(question.get("topic")),
+            "difficulty": _normalize_difficulty(question.get("difficulty")),
+            "question_text": _normalize_text(question.get("question_text"))[:220],
+            "selected_answer": _normalize_text(question.get("selected_answer")),
+            "correct_answer": _normalize_text(question.get("correct_answer")),
+            "is_correct": bool(question.get("is_correct", False)),
+            "answer_changed": bool(question.get("answer_changed", False)),
+        })
+
+    try:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            return _fallback_comprehensive_analysis(prepared)
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config={"temperature": 0.3},
+        )
+
+        rows = []
+        for row in prepared:
+            rows.append(
+                f"Q{row['index']} | {row['topic']} | {row['difficulty']} | "
+                f"{'correct' if row['is_correct'] else 'incorrect'} | "
+                f"Selected: {row['selected_answer'] or '[blank]'} | "
+                f"Correct: {row['correct_answer'] or '[n/a]'} | "
+                f"Changed: {'yes' if row['answer_changed'] else 'no'} | "
+                f"Question: {row['question_text'] or '[n/a]'}"
+            )
+
+        prompt = f"""You are an advanced Academic Evaluation AI.
+
+Your task is NOT to summarize or give generic feedback.
+Your task is to deeply ANALYZE a student's actual answer script and identify their REAL conceptual understanding.
+
+OBJECTIVE:
+- Understand what the student actually wrote
+- Compare it with expected answers
+- Identify missing concepts
+- Detect misunderstood topics
+- Detect skipped or weak sections
+
+STRICT RULES:
+- DO NOT give generic advice
+- DO NOT mention marks or grades
+- Every conclusion must be evidence-based and reference specific questions
+- If evidence is insufficient, return exactly: No deep conceptual pattern detected from current answer script.
+
+OUTPUT FORMAT:
+## Deep Conceptual Analysis
+- [Topic Weakness] ...with evidence
+- [Missing Concepts] ...specific concept gaps
+- [Answer Quality Issue] ...vague/incomplete reasoning
+
+## Knowledge Coverage Summary
+- Strong Areas:
+- Weak Areas:
+- Skipped/Partially Answered Areas:
+
+## Thinking Pattern Observed
+- Diagnose if memorizing / partial understanding / core misunderstanding
+
+Student question-level evidence:
+{chr(10).join(rows)}
+"""
+
+        response = model.generate_content(prompt)
+        result = _normalize_text(getattr(response, "text", ""))
+        if not result:
+            return _fallback_comprehensive_analysis(prepared)
+        return result.splitlines()
+    except Exception:
+        return _fallback_comprehensive_analysis(prepared)
+
+
+def _fallback_comprehensive_analysis(prepared_rows):
+    if not prepared_rows:
+        return ["No deep conceptual pattern detected from current answer script."]
+
+    by_topic = {}
+    skipped = []
+    for row in prepared_rows:
+        topic = row["topic"]
+        by_topic.setdefault(topic, {"total": 0, "correct": 0, "wrong": []})
+        by_topic[topic]["total"] += 1
+        if row["is_correct"]:
+            by_topic[topic]["correct"] += 1
+        else:
+            by_topic[topic]["wrong"].append(row)
+        if not row["selected_answer"]:
+            skipped.append(f"Q{row['index']} ({topic})")
+
+    strong_areas = []
+    weak_areas = []
+    deep_lines = ["## Deep Conceptual Analysis"]
+
+    for topic, stats in by_topic.items():
+        total = stats["total"]
+        correct = stats["correct"]
+        wrong = stats["wrong"]
+        if total >= 2 and correct == total:
+            strong_areas.append(topic)
+        if wrong:
+            weak_areas.append(topic)
+            evidence = []
+            for row in wrong[:2]:
+                evidence.append(
+                    f"Q{row['index']} selected '{row['selected_answer'] or '[blank]'}' instead of '{row['correct_answer'] or '[n/a]'}'"
+                )
+            deep_lines.append(
+                f"- [Topic Weakness] {topic}: repeated confusion seen in {', '.join(evidence)}."
+            )
+
+    if not weak_areas and not skipped:
+        return ["No deep conceptual pattern detected from current answer script."]
+
+    deep_lines.append("- [Missing Concepts] Incorrect responses indicate concept-level gaps in the weak areas listed below.")
+    if skipped:
+        deep_lines.append(f"- [Answer Quality Issue] Some responses were skipped or blank: {', '.join(skipped[:5])}.")
+
+    summary_lines = [
+        "## Knowledge Coverage Summary",
+        f"- Strong Areas: {', '.join(strong_areas) if strong_areas else 'No clearly strong area from current script.'}",
+        f"- Weak Areas: {', '.join(weak_areas) if weak_areas else 'No repeated weak area detected.'}",
+        f"- Skipped/Partially Answered Areas: {', '.join(skipped[:5]) if skipped else 'No fully skipped answer detected.'}",
+    ]
+
+    if weak_areas and strong_areas:
+        thinking = "- The student shows partial understanding: stable in some topics but repeats concept-level errors in others."
+    elif weak_areas:
+        thinking = "- The student appears to rely on partial recall and misses core conceptual distinctions across multiple questions."
+    else:
+        thinking = "- No deep conceptual pattern detected from current answer script."
+
+    thinking_lines = [
+        "## Thinking Pattern Observed",
+        thinking,
+    ]
+
+    return deep_lines + [""] + summary_lines + [""] + thinking_lines
+
+
+def _concept_match(expected_concept, answer_text):
+    concept = _normalize_text(expected_concept).lower()
+    answer = _normalize_text(answer_text).lower()
+    if not concept:
+        return "missing"
+    if concept in answer:
+        return "covered"
+
+    concept_tokens = [token for token in concept.replace("-", " ").split() if len(token) >= 4]
+    if concept_tokens and any(token in answer for token in concept_tokens):
+        return "partial"
+    return "missing"
+
+
+def _build_deep_analysis_fallback(questions, answer_map):
+    topic_evidence = {}
+    topic_missing = {}
+    strong_topics = set()
+    weak_topics = set()
+    skipped = []
+    quality_issues = []
+
+    for idx, question in enumerate(questions, start=1):
+        question_text = _normalize_text(question.get("question_text"))
+        topic = _normalize_topic(question.get("topic"))
+        expected = question.get("expected_concepts") or []
+        if not isinstance(expected, list):
+            expected = [str(expected)]
+
+        answer = _normalize_text(
+            answer_map.get(str(idx), "")
+            or answer_map.get(question_text, "")
+            or answer_map.get(str(question.get("question_id", "")), "")
+            or question.get("student_answer", "")
+        )
+
+        topic_evidence.setdefault(topic, [])
+        topic_missing.setdefault(topic, {})
+
+        if not answer:
+            skipped.append(f"Q{idx} ({topic}): no answer was written.")
+            topic_evidence[topic].append(f"Q{idx} was skipped.")
+            weak_topics.add(topic)
+            continue
+
+        if len(answer.split()) < 8:
+            quality_issues.append(
+                f"Q{idx} ({topic}) is very short and vague, suggesting incomplete reasoning."
+            )
+
+        covered = 0
+        partial = 0
+        missing = 0
+        missing_concepts = []
+
+        for concept in expected:
+            status = _concept_match(concept, answer)
+            if status == "covered":
+                covered += 1
+            elif status == "partial":
+                partial += 1
+            else:
+                missing += 1
+                missing_concepts.append(str(concept))
+                topic_missing[topic][str(concept)] = topic_missing[topic].get(str(concept), 0) + 1
+
+        topic_evidence[topic].append(
+            f"Q{idx}: covered={covered}, partial={partial}, missing={missing}."
+        )
+
+        if expected and covered >= max(1, int(len(expected) * 0.7)) and missing == 0:
+            strong_topics.add(topic)
+        if missing > 0 or partial > 0:
+            weak_topics.add(topic)
+            if missing_concepts:
+                quality_issues.append(
+                    f"Q{idx} ({topic}) misses concepts: {', '.join(missing_concepts[:4])}."
+                )
+
+    if not weak_topics and not quality_issues and not skipped:
+        return "No deep conceptual pattern detected from current answer script."
+
+    deep_lines = ["## Deep Conceptual Analysis"]
+    for topic in sorted(weak_topics):
+        repeated_missing = [
+            concept for concept, count in topic_missing.get(topic, {}).items() if count >= 2
+        ]
+        repeated_text = (
+            f"Repeated missing concepts: {', '.join(repeated_missing[:4])}."
+            if repeated_missing
+            else "Missing concepts are spread across multiple questions in this topic."
+        )
+        evidence_text = " ".join(topic_evidence.get(topic, [])[:3])
+        deep_lines.append(
+            f"- [{topic} Weakness]: {repeated_text} Evidence: {evidence_text}"
+        )
+
+    if quality_issues:
+        for issue in quality_issues[:5]:
+            deep_lines.append(f"- [Answer Quality Issue]: {issue}")
+
+    coverage_lines = [
+        "## Knowledge Coverage Summary",
+        f"- Strong Areas: {', '.join(sorted(strong_topics)) if strong_topics else 'No clearly strong topic from current script.'}",
+        f"- Weak Areas: {', '.join(sorted(weak_topics)) if weak_topics else 'No repeated weak topic detected.'}",
+        f"- Skipped/Partially Answered Areas: {'; '.join(skipped[:5]) if skipped else 'No fully skipped answer detected.'}",
+    ]
+
+    thinking_lines = ["## Thinking Pattern Observed"]
+    if skipped and weak_topics:
+        thinking_lines.append(
+            "- The script suggests partial understanding with avoidance of concept-heavy parts, not full conceptual command."
+        )
+    elif weak_topics and quality_issues:
+        thinking_lines.append(
+            "- The student appears to know fragments of topics but struggles to connect definitions, reasoning, and complete explanations."
+        )
+    elif weak_topics:
+        thinking_lines.append(
+            "- The student shows partial topic familiarity but recurring conceptual omissions across related questions."
+        )
+    else:
+        thinking_lines.append(
+            "- No deep conceptual pattern detected from current answer script."
+        )
+
+    return "\n".join(deep_lines + [""] + coverage_lines + [""] + thinking_lines)
+
+
+def deep_answer_script_analysis(questions, student_answers):
+    if not isinstance(questions, list) or not questions:
+        return "No deep conceptual pattern detected from current answer script."
+
+    answer_map = {}
+    if isinstance(student_answers, dict):
+        answer_map = {str(k): _normalize_text(v) for k, v in student_answers.items()}
+    elif isinstance(student_answers, list):
+        for idx, item in enumerate(student_answers, start=1):
+            if isinstance(item, str):
+                answer_map[str(idx)] = _normalize_text(item)
+                continue
+            if not isinstance(item, dict):
+                continue
+            answer_text = _normalize_text(item.get("answer_text") or item.get("answer") or item.get("content"))
+            key_candidates = [
+                str(item.get("question_id", "")),
+                _normalize_text(item.get("question_text")),
+                str(idx),
+            ]
+            for key in key_candidates:
+                if key:
+                    answer_map[key] = answer_text
+
+    non_empty_answers = sum(1 for value in answer_map.values() if value)
+    if non_empty_answers < 2:
+        return "No deep conceptual pattern detected from current answer script."
+
+    try:
+        api_key = os.getenv("GOOGLE_API_KEY")
+        if not api_key:
+            return _build_deep_analysis_fallback(questions, answer_map)
+
+        normalized_questions = []
+        for idx, question in enumerate(questions, start=1):
+            if not isinstance(question, dict):
+                continue
+            question_text = _normalize_text(question.get("question_text"))
+            topic = _normalize_topic(question.get("topic"))
+            expected = question.get("expected_concepts") or []
+            if not isinstance(expected, list):
+                expected = [str(expected)]
+            answer = _normalize_text(
+                question.get("student_answer")
+                or answer_map.get(str(question.get("question_id", "")), "")
+                or answer_map.get(question_text, "")
+                or answer_map.get(str(idx), "")
+            )
+            normalized_questions.append({
+                "index": idx,
+                "question_text": question_text,
+                "topic": topic,
+                "expected_concepts": [str(x) for x in expected],
+                "student_answer": answer,
+            })
+
+        if len(normalized_questions) < 2:
+            return "No deep conceptual pattern detected from current answer script."
+
+        payload = ""
+        for row in normalized_questions:
+            payload += (
+                f"\nQ{row['index']}"
+                f"\nQuestion: {row['question_text']}"
+                f"\nTopic: {row['topic']}"
+                f"\nExpected Concepts: {', '.join(row['expected_concepts']) if row['expected_concepts'] else 'None provided'}"
+                f"\nStudent Answer: {row['student_answer'] or '[No answer]'}\n"
+            )
+
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name="gemini-2.5-flash",
+            generation_config={"temperature": 0.35},
+        )
+
+        prompt = f"""You are an advanced Academic Evaluation AI.
+
+Your task is NOT to summarize or give generic feedback.
+Your task is to deeply ANALYZE a student's actual answer script and identify their REAL conceptual understanding.
+
+OBJECTIVE:
+- Understand what the student actually wrote
+- Compare it with expected answers
+- Identify missing concepts
+- Detect misunderstood topics
+- Detect skipped or weak sections
+
+CORE RULES:
+1) Perform concept matching for each question:
+   - Correctly covered
+   - Partially covered
+   - Completely missing
+2) Detect repeated conceptual gaps across all questions.
+3) Detect irrelevant, vague, or avoidance-style answers.
+4) Topic-level weakness mapping must include reason and evidence.
+5) Every conclusion must cite evidence from specific question answers.
+
+STRICT RULES:
+- No generic advice
+- No template feedback
+- No marks or grades
+- No scoring language
+
+OUTPUT FORMAT (exact headings):
+## Deep Conceptual Analysis
+- [Topic Weakness]: explanation with evidence from multiple answers
+- [Missing Concepts]: specific concepts not included
+- [Answer Quality Issue]: vague/incomplete reasoning evidence
+
+## Knowledge Coverage Summary
+- Strong Areas:
+- Weak Areas:
+- Skipped/Partially Answered Areas:
+
+## Thinking Pattern Observed
+- Diagnose how the student thinks (memorization/partial understanding/misunderstanding) with evidence.
+
+If evidence is insufficient, return exactly:
+No deep conceptual pattern detected from current answer script.
+
+Question paper and extracted student answers:
+{payload}
+"""
+
+        response = model.generate_content(prompt)
+        result = _normalize_text(getattr(response, "text", ""))
+        if not result:
+            return _build_deep_analysis_fallback(normalized_questions, answer_map)
+        return result
+    except Exception:
+        return _build_deep_analysis_fallback(questions, answer_map)

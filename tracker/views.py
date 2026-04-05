@@ -18,6 +18,8 @@ from tracker.ai_core.logic import (
     analyze_test_behavior,
     build_ai_tutor_context,
     fallback_student_chat_response,
+    deep_answer_script_analysis,
+    comprehensive_answer_analysis,
 )
 
 logger = logging.getLogger(__name__)
@@ -93,7 +95,6 @@ def _run_performance_analysis(new_mark):
             f'({previous_score}% -> {latest_score}%). Please review your preparation.'
         )
     elif gradual_drop:
-        warning_pattern = 'gradual_decline'
         warning_message = (
             f'Your performance in {subject_label} has been gradually decreasing across the last '
             f'three tests ({subject_scores[-3]}% -> {subject_scores[-2]}% -> {subject_scores[-1]}%). '
@@ -206,6 +207,21 @@ def _coerce_aware_datetime(value):
         dt = timezone.make_aware(dt, timezone.get_current_timezone())
 
     return dt
+
+
+def _can_student_attempt_test(test, student, allow_expired_submission=False):
+    now = timezone.now()
+
+    if _student_has_submitted_test(student, test):
+        return False, 'Test already submitted.'
+
+    if test.start_time and now < test.start_time:
+        return False, 'Test has not started yet.'
+
+    if test.end_time and now > test.end_time and not allow_expired_submission:
+        return False, 'Test time has expired.'
+
+    return True, ''
 
 
 
@@ -445,6 +461,7 @@ class StudentAITutorView(APIView):
                 attempt = item['attempt']
                 test = item['test']
                 mark = item['mark']
+                question_rows = _question_level_rows(test, student) if test else []
 
                 score = float((attempt.score if attempt else (mark.marks_obtained if mark else 0)) or 0)
                 total_marks = float((attempt.total_marks if attempt else (mark.total_marks if mark else 0)) or 0)
@@ -457,29 +474,37 @@ class StudentAITutorView(APIView):
 
                 conceptual_patterns = attempt.conceptual_patterns if attempt else []
                 behavior_patterns = attempt.behavior_patterns if attempt else []
+                strengths = []
 
-                # Backfill older attempts once, then reuse stored result.
-                if test and (not conceptual_patterns or not behavior_patterns):
-                    questions_data = _question_level_rows(test, student)
-                    conceptual_patterns = analyze_conceptual_mistakes(questions_data) if questions_data else ["No review available."]
-                    behavior_patterns = analyze_test_behavior(questions_data) if questions_data else ["No review available."]
-                    if attempt and _table_exists('tracker_testattempt'):
-                        attempt.conceptual_patterns = conceptual_patterns
-                        attempt.behavior_patterns = behavior_patterns
-                        attempt.save(update_fields=['conceptual_patterns', 'behavior_patterns', 'updated_at'])
-                    elif mark and _table_exists('tracker_testattempt'):
-                        attempt, _ = TestAttempt.objects.update_or_create(
-                            student=student,
-                            test=test,
-                            defaults=_legacy_attempt_defaults(
-                                student,
-                                test,
-                                mark,
-                                questions_data,
-                                conceptual_patterns,
-                                behavior_patterns,
-                            ),
-                        )
+                # Refresh from the actual submitted rows whenever they exist.
+                if test and question_rows:
+                    conceptual_patterns = analyze_conceptual_mistakes(question_rows)
+                    behavior_patterns = analyze_test_behavior(question_rows)
+                    strengths = _analyze_question_strengths(question_rows)
+                    if _table_exists('tracker_testattempt'):
+                        if attempt:
+                            attempt.conceptual_patterns = conceptual_patterns
+                            attempt.behavior_patterns = behavior_patterns
+                            attempt.save(update_fields=['conceptual_patterns', 'behavior_patterns', 'updated_at'])
+                        elif mark:
+                            attempt, _ = TestAttempt.objects.update_or_create(
+                                student=student,
+                                test=test,
+                                defaults=_legacy_attempt_defaults(
+                                    student,
+                                    test,
+                                    mark,
+                                    question_rows,
+                                    conceptual_patterns,
+                                    behavior_patterns,
+                                ),
+                            )
+                elif test:
+                    strengths = _analyze_question_strengths(question_rows)
+
+                mastery_summary = strengths[0] if strengths else "No strong mastery summary available yet."
+
+                comprehensive_analysis = comprehensive_answer_analysis(question_rows) if question_rows else []
 
                 test_entries.append({
                     'test_id': test.id if test else f"legacy-{mark.id}",
@@ -490,6 +515,9 @@ class StudentAITutorView(APIView):
                     'percentage': pct,
                     'conceptual_mistakes': _pattern_message("No strong patterns detected yet.", conceptual_patterns),
                     'behavior_patterns': _pattern_message("No clear behavior patterns detected.", behavior_patterns),
+                    'strengths': _strength_message("No strong strengths detected yet.", strengths),
+                    'mastery_summary': mastery_summary,
+                    'comprehensive_analysis': comprehensive_analysis if isinstance(comprehensive_analysis, list) else [comprehensive_analysis],
                 })
 
             for index, entry in enumerate(test_entries):
@@ -507,11 +535,47 @@ class StudentAITutorView(APIView):
                 'recent_score': recent_score,
                 'conceptual_mistakes': latest_test['conceptual_mistakes'] if latest_test else ["No review available."],
                 'behavior_patterns': latest_test['behavior_patterns'] if latest_test else ["No review available."],
+                'strengths': latest_test['strengths'] if latest_test else ["No review available."],
+                'mastery_summary': latest_test['mastery_summary'] if latest_test else "No review available.",
                 'tests': list(reversed(test_entries)),
             })
 
         subjects_data.sort(key=lambda item: item['test_count'], reverse=True)
         return Response({'subjects': subjects_data})
+
+
+class DeepAnswerScriptAnalysisView(APIView):
+        """
+        POST /api/answer-script/deep-analysis/
+
+        Body:
+        {
+            "questions": [
+                {
+                    "question_id": 1,
+                    "question_text": "...",
+                    "topic": "...",
+                    "expected_concepts": ["...", "..."]
+                }
+            ],
+            "student_answers": [
+                {"question_id": 1, "answer_text": "..."}
+            ]
+        }
+        """
+
+        def post(self, request):
+                questions = request.data.get('questions', [])
+                student_answers = request.data.get('student_answers', {})
+
+                if not isinstance(questions, list) or not questions:
+                        return Response(
+                                {'error': 'questions must be a non-empty list.'},
+                                status=status.HTTP_400_BAD_REQUEST,
+                        )
+
+                analysis = deep_answer_script_analysis(questions, student_answers)
+                return Response({'analysis': analysis}, status=status.HTTP_200_OK)
 
 
 class SubjectListCreateView(generics.ListCreateAPIView):
@@ -1082,6 +1146,72 @@ def _pattern_message(default_message, patterns):
     return [default_message]
 
 
+def _strength_message(default_message, strengths):
+    if isinstance(strengths, list) and strengths:
+        return strengths
+    return [default_message]
+
+
+def _analyze_question_strengths(question_rows):
+    if not question_rows:
+        return ["No strong mastery evidence available yet."]
+
+    topic_stats = {}
+    total_correct = 0
+    total_questions = len(question_rows)
+
+    for row in question_rows:
+        topic = str(row.get('topic') or 'General').strip() or 'General'
+        topic_stats.setdefault(topic, {'total': 0, 'correct': 0, 'examples': []})
+        topic_stats[topic]['total'] += 1
+        if row.get('is_correct'):
+            topic_stats[topic]['correct'] += 1
+            total_correct += 1
+            if len(topic_stats[topic]['examples']) < 2:
+                topic_stats[topic]['examples'].append(str(row.get('question_text', '')).strip())
+
+    strengths = []
+    strong_topics = []
+
+    for topic, stats in topic_stats.items():
+        total = int(stats.get('total', 0))
+        correct = int(stats.get('correct', 0))
+        pct = round((correct / total) * 100) if total else 0
+        if total >= 2 and pct >= 75:
+            strong_topics.append((topic, pct, stats.get('examples', [])))
+
+    strong_topics.sort(key=lambda item: (item[1], item[0]), reverse=True)
+
+    if total_questions and total_correct == total_questions:
+        strengths.append(
+            "- You answered the full script correctly, which shows solid conceptual coverage across the tested topics."
+        )
+        best_topic = max(topic_stats.items(), key=lambda item: (item[1]['correct'], item[1]['total']))[0]
+        strengths.append(
+            f"- {best_topic} looks particularly well established because every question from that topic was handled correctly."
+        )
+        return strengths
+
+    if strong_topics:
+        for topic, pct, examples in strong_topics[:4]:
+            example_text = f" Examples: {', '.join(examples)}." if examples else ""
+            strengths.append(
+                f"- {topic} is a clear strength because most questions from this topic were answered correctly ({pct}% correct).{example_text}"
+            )
+
+    high_confidence_topics = [topic for topic, stats in topic_stats.items() if int(stats.get('correct', 0)) >= 2 and int(stats.get('correct', 0)) >= int(stats.get('total', 0)) - 1]
+    for topic in high_confidence_topics:
+        if all(topic not in line for line in strengths):
+            strengths.append(
+                f"- {topic} appears well controlled: the answers from this area show consistent concept recall and few misses."
+            )
+
+    if not strengths:
+        strengths.append("- The script shows some correct concept handling, but not enough repeated evidence to isolate a strong mastery pattern.")
+
+    return strengths
+
+
 def _build_comparison(current_entry, previous_entry):
     if not previous_entry:
         return {
@@ -1222,6 +1352,7 @@ def _finalize_test_submission(test, student, runtime=None):
     question_rows = _question_level_rows(test, student)
     conceptual_patterns = analyze_conceptual_mistakes(question_rows) if question_rows else ["No review available."]
     behavior_patterns = analyze_test_behavior(question_rows) if question_rows else ["No review available."]
+    strengths = _analyze_question_strengths(question_rows) if question_rows else ["No review available."]
 
     question_bank = _coerce_question_bank(test)
     for question in question_bank:
@@ -1253,8 +1384,14 @@ def _finalize_test_submission(test, student, runtime=None):
                     'marks_awarded': 1.0 if is_correct else 0.0,
                 },
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(
+                'StudentTestResponse write skipped for student_id=%s test_id=%s question_id=%s error=%s',
+                student.id,
+                test.id,
+                question_id,
+                str(exc),
+            )
 
     if _table_exists('tracker_testattempt'):
         TestAttempt.objects.update_or_create(
@@ -1286,7 +1423,7 @@ def _finalize_test_submission(test, student, runtime=None):
                 'percentage': round((stats['score'] / stats['total_marks']) * 100, 2) if stats['total_marks'] else 0,
                 'status': 'Completed',
                 'topic_wise_analysis': stats['topic_wise_analysis'],
-                'strengths': [],
+                'strengths': strengths,
                 'weaknesses': [],
                 'recommendations': '',
                 'predicted_performance': {},
@@ -1462,6 +1599,10 @@ class StudentSingleResponseView(APIView):
             return Response({'error': 'student_id and question_id are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         student = get_object_or_404(Student, pk=student_id)
+        can_attempt, reason = _can_student_attempt_test(test, student, allow_expired_submission=True)
+        if not can_attempt:
+            return Response({'error': reason}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             question_id = int(question_id)
         except (TypeError, ValueError):
@@ -1507,6 +1648,9 @@ class StudentSubmitTestView(APIView):
             return Response({'error': 'student_id is required.'}, status=status.HTTP_400_BAD_REQUEST)
 
         student = get_object_or_404(Student, pk=student_id)
+        can_attempt, reason = _can_student_attempt_test(test, student)
+        if not can_attempt:
+            return Response({'error': reason}, status=status.HTTP_400_BAD_REQUEST)
 
         key = _runtime_cache_key(student.id, test.id)
         runtime = cache.get(key, {})
@@ -1958,3 +2102,113 @@ def RevokeTeacherAccessView(request, pk):
     teacher.status = 'rejected'
     teacher.save(update_fields=['status', 'updated_at'])
     return Response({'message': 'Teacher access removed.'}, status=status.HTTP_200_OK)
+
+
+@api_view(['POST'])
+def TeacherClassChatView(request):
+    assigned_class = str(request.data.get('assigned_class', '')).strip()
+    message = str(request.data.get('message', '')).strip()
+    history = request.data.get('history', [])
+
+    if not assigned_class:
+        return Response({'error': 'assigned_class is required.'}, status=status.HTTP_400_BAD_REQUEST)
+    if not message:
+        return Response({'error': 'message is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+    students = list(Student.objects.filter(class_name=assigned_class).order_by('name'))
+    if not students:
+        return Response({'reply': f'No students were found in class {assigned_class}.'}, status=status.HTTP_200_OK)
+
+    student_ids = [s.id for s in students]
+    marks = list(TestMark.objects.filter(student_id__in=student_ids).order_by('date_taken', 'id'))
+
+    overall_scores = []
+    subject_bucket = {}
+    student_bucket = {}
+
+    for mark in marks:
+        if not mark.total_marks:
+            continue
+        pct = round((mark.marks_obtained / mark.total_marks) * 100, 2)
+        overall_scores.append(pct)
+
+        subject = _subject_label(mark.subject)
+        subject_bucket.setdefault(subject, []).append(pct)
+
+        student_bucket.setdefault(mark.student_id, {'name': mark.student.name, 'scores': []})
+        student_bucket[mark.student_id]['scores'].append(pct)
+
+    class_avg = round(sum(overall_scores) / len(overall_scores), 2) if overall_scores else 0
+    subject_lines = []
+    for subject, scores in sorted(subject_bucket.items(), key=lambda item: item[0]):
+        avg = round(sum(scores) / len(scores), 2) if scores else 0
+        subject_lines.append(f"- {subject}: {avg}% average")
+
+    student_averages = []
+    for info in student_bucket.values():
+        scores = info['scores']
+        avg = round(sum(scores) / len(scores), 2) if scores else 0
+        student_averages.append((info['name'], avg))
+
+    student_averages.sort(key=lambda row: row[1])
+    lowest = student_averages[:3]
+    improving_hint = sorted(student_averages, key=lambda row: row[1], reverse=True)[:3]
+
+    class_context = (
+        "You are a class performance assistant for a teacher.\n"
+        "Use only the class data provided below.\n"
+        "Avoid generic advice and keep answers concise and actionable.\n\n"
+        f"Assigned class: {assigned_class}\n"
+        f"Total students: {len(students)}\n"
+        f"Marks records available: {len(marks)}\n"
+        f"Class average score: {class_avg}%\n\n"
+        "Subject averages:\n"
+        + ("\n".join(subject_lines) if subject_lines else "- No subject marks available yet")
+        + "\n\n"
+        + "Students needing attention (lowest averages):\n"
+        + (
+            "\n".join([f"- {name}: {avg}%" for name, avg in lowest])
+            if lowest else "- No student-level averages available yet"
+        )
+        + "\n\n"
+        + "Top current performers:\n"
+        + (
+            "\n".join([f"- {name}: {avg}%" for name, avg in improving_hint])
+            if improving_hint else "- No student-level averages available yet"
+        )
+    )
+
+    conversation = []
+    if isinstance(history, list):
+        for turn in history:
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get('role')
+            parts = turn.get('parts')
+            if role not in {'user', 'model'}:
+                continue
+            if not isinstance(parts, list) or not parts:
+                continue
+            conversation.append({'role': role, 'parts': [str(parts[0])[:2000]]})
+
+    conversation.append({'role': 'user', 'parts': [message]})
+
+    reply = chat_with_student_context(class_context, conversation)
+    if isinstance(reply, str) and reply.startswith('Error:'):
+        if not marks:
+            reply = (
+                f"I can only see enrollment data for class {assigned_class} right now. "
+                "There are no marks yet, so I cannot rank interventions."
+            )
+        else:
+            weakest_subject = min(
+                subject_bucket.items(),
+                key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else 0,
+            )[0] if subject_bucket else 'General'
+            reply = (
+                f"Based on available records for {assigned_class}, class average is {class_avg}%. "
+                f"Weakest subject trend appears in {weakest_subject}. "
+                "Prioritize students in the bottom-3 list and run targeted remediation on that subject first."
+            )
+
+    return Response({'reply': reply}, status=status.HTTP_200_OK)
