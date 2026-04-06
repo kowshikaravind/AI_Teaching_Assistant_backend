@@ -7,6 +7,7 @@ from .views import (
     StudentChatView,
     StudentAITutorView,
     DeepAnswerScriptAnalysisView,
+    ValidateAIAnalysisOutputView,
     SubjectListCreateView,
     SubjectDeleteView,
     StudentLoginView,
@@ -53,6 +54,7 @@ urlpatterns = [
     path('students/<int:pk>/chat/', StudentChatView.as_view()),
     path('students/<int:pk>/ai-tutor/', StudentAITutorView.as_view()),
     path('answer-script/deep-analysis/', DeepAnswerScriptAnalysisView.as_view()),
+    path('answer-script/validate-analysis/', ValidateAIAnalysisOutputView.as_view()),
 
     # ── Subjects ──────────────────────────────────────────────────
     path('subjects/', SubjectListCreateView.as_view()),

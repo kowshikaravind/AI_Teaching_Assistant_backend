@@ -1,564 +1,937 @@
+import logging
 import os
+import json
+import re
+import time
+from collections import Counter, defaultdict
 
+from django.conf import settings
+from django.core.cache import cache
 from dotenv import load_dotenv
 import google.generativeai as genai
 
 load_dotenv()
+logger = logging.getLogger(__name__)
 
-MIN_INCORRECT_FOR_CONCEPT = 2
-MIN_QUESTIONS_FOR_BEHAVIOR = 3
-MAX_INCORRECT_FOR_AI = 25
-
-NO_REVIEW_MESSAGE = "No review available."
-NO_CONCEPT_PATTERN_MESSAGE = "No strong patterns detected yet."
-NO_BEHAVIOR_PATTERN_MESSAGE = "No clear behavior patterns detected."
+_LLM_COOLDOWN_KEY = "apt:ai:llm:cooldown:until"
 
 
-def _normalize_difficulty(value):
-    normalized = str(value or "medium").strip().lower()
-    return normalized if normalized in {"easy", "medium", "hard"} else "medium"
+def _is_llm_enabled():
+    return bool(getattr(settings, "APT_AI_LLM_ENABLED", True))
 
 
-def _normalize_topic(value):
-    return str(value or "General").strip() or "General"
+def _llm_model_name():
+    return str(getattr(settings, "APT_AI_LLM_MODEL", "gemini-2.5-flash") or "gemini-2.5-flash")
+
+
+def _llm_cooldown_seconds():
+    try:
+        return max(10, int(getattr(settings, "APT_AI_LLM_COOLDOWN_SECONDS", 180) or 180))
+    except Exception:
+        return 180
+
+
+def _llm_max_calls_per_minute():
+    try:
+        return max(1, int(getattr(settings, "APT_AI_LLM_MAX_CALLS_PER_MINUTE", 6) or 6))
+    except Exception:
+        return 6
+
+
+def _llm_max_retries():
+    try:
+        return max(0, int(getattr(settings, "APT_AI_LLM_MAX_RETRIES", 1) or 1))
+    except Exception:
+        return 1
+
+
+def _llm_backoff_seconds():
+    try:
+        return max(0.0, float(getattr(settings, "APT_AI_LLM_BACKOFF_SECONDS", 1.0) or 1.0))
+    except Exception:
+        return 1.0
+
+
+def _in_llm_cooldown():
+    until = cache.get(_LLM_COOLDOWN_KEY)
+    if until is None:
+        return False
+    try:
+        return float(until) > time.time()
+    except Exception:
+        return False
+
+
+def _start_llm_cooldown(seconds):
+    ttl = max(10, int(seconds or _llm_cooldown_seconds()))
+    cache.set(_LLM_COOLDOWN_KEY, time.time() + ttl, timeout=ttl)
+
+
+def _reserve_llm_call_slot():
+    max_calls = _llm_max_calls_per_minute()
+    bucket = int(time.time() // 60)
+    key = f"apt:ai:llm:calls:{bucket}"
+    current = cache.get(key)
+    if current is None:
+        cache.set(key, 1, timeout=70)
+        return True
+    try:
+        count = int(current)
+    except Exception:
+        count = 0
+    if count >= max_calls:
+        return False
+    cache.set(key, count + 1, timeout=70)
+    return True
+
+
+def _retry_delay_from_error(message):
+    text = _normalize_text(message)
+    match = re.search(r"retry\s+in\s+([0-9]*\.?[0-9]+)s", text, flags=re.IGNORECASE)
+    if not match:
+        return None
+    try:
+        return max(1, int(float(match.group(1))))
+    except Exception:
+        return None
+
+
+def _is_quota_error(message):
+    text = _normalize_text(message).lower()
+    return "429" in text or "quota" in text or "rate limit" in text
+
+
+def _extract_json_object(text):
+    raw = _normalize_text(text)
+    if not raw:
+        return None
+
+    # First try direct JSON.
+    try:
+        parsed = json.loads(raw)
+        return parsed if isinstance(parsed, dict) else None
+    except Exception:
+        pass
+
+    # Then try fenced block.
+    if "```" in raw:
+        parts = raw.split("```")
+        for part in parts:
+            candidate = part.strip()
+            if candidate.lower().startswith("json"):
+                candidate = candidate[4:].strip()
+            try:
+                parsed = json.loads(candidate)
+                if isinstance(parsed, dict):
+                    return parsed
+            except Exception:
+                continue
+
+    # Last attempt: find outer-most JSON object.
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start != -1 and end != -1 and end > start:
+        candidate = raw[start : end + 1]
+        try:
+            parsed = json.loads(candidate)
+            return parsed if isinstance(parsed, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+def _option_text(options, answer_key):
+    if not isinstance(options, dict):
+        return ""
+    key = _normalize_text(answer_key)
+    if not key:
+        return ""
+    value = options.get(key)
+    return _normalize_text(value)
+
+
+def _build_llm_topic_payload(wrong_rows):
+    grouped = defaultdict(list)
+    for row in wrong_rows:
+        grouped[row["topic"]].append(row)
+
+    topics = []
+    for topic, rows in grouped.items():
+        topic_rows = []
+        for row in rows:
+            options = row.get("options") if isinstance(row.get("options"), dict) else {}
+            topic_rows.append({
+                "question_id": row.get("question_id"),
+                "subtopic": row.get("subtopic"),
+                "difficulty": row.get("difficulty"),
+                "question_text": row.get("question_text"),
+                "options": options,
+                "student_answer_key": row.get("student_answer"),
+                "student_answer_text": _option_text(options, row.get("student_answer")),
+                "correct_answer_key": row.get("correct_answer"),
+                "correct_answer_text": _option_text(options, row.get("correct_answer")),
+                "time_taken_seconds": row.get("time_taken_seconds", 0),
+                "answer_changed": bool(row.get("answer_changed", False)),
+            })
+        topics.append({
+            "topic": topic,
+            "question_count": len(topic_rows),
+            "mistakes": topic_rows,
+        })
+    return topics
+
+
+def _run_llm_semantic_analysis(
+    wrong_rows,
+    student_name=None,
+    test_name=None,
+    subject_name=None,
+):
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not _is_llm_enabled() or not api_key or not wrong_rows:
+        return None
+
+    if _in_llm_cooldown():
+        logger.info("Skipping LLM semantic analysis due to cooldown window.")
+        return None
+
+    if not _reserve_llm_call_slot():
+        logger.info("Skipping LLM semantic analysis due to per-minute call budget.")
+        return None
+
+    try:
+        genai.configure(api_key=api_key)
+        model = genai.GenerativeModel(
+            model_name=_llm_model_name(),
+            generation_config={"temperature": 0.2},
+        )
+
+        topics_payload = _build_llm_topic_payload(wrong_rows)
+        prompt_payload = {
+            "student_name": _normalize_text(student_name),
+            "test_name": _normalize_text(test_name),
+            "subject_name": _normalize_text(subject_name),
+            "topics": topics_payload,
+        }
+
+        prompt = (
+            "You are an expert academic reasoning analyst.\n"
+            "Analyze only the provided wrong answers, grouped by topic.\n"
+            "Infer conceptual misunderstandings and behavior patterns from question semantics, options chosen, and timing.\n"
+            "Avoid generic statements. Explain WHY the student likely chose the wrong option.\n"
+            "Connect patterns across multiple questions in the same topic and across topics when possible.\n"
+            "Return ONLY valid JSON using this schema:\n"
+            "{\n"
+            "  \"topic_summaries\": [\n"
+            "    {\n"
+            "      \"topic\": \"string\",\n"
+            "      \"understanding_summary\": \"2-4 sentence summary of conceptual understanding for this topic\",\n"
+            "      \"key_misconceptions\": [\"...\"],\n"
+            "      \"cross_question_pattern\": \"How mistakes connect across this topic\"\n"
+            "    }\n"
+            "  ],\n"
+            "  \"conceptual_patterns\": [\"3-6 concise pattern statements with reasoning\"],\n"
+            "  \"behavior_patterns\": [\"2-5 behavior interpretations tied to evidence\"],\n"
+            "  \"detailed_mistakes\": [\n"
+            "    {\n"
+            "      \"question_id\": \"string or number\",\n"
+            "      \"classification\": \"Conceptual Error|Careless Mistake|Misinterpretation|Logic Error|Guessing\",\n"
+            "      \"why_student_chose_this\": \"reasoned explanation\",\n"
+            "      \"why_it_is_wrong\": \"specific correction\",\n"
+            "      \"correct_thinking\": \"how to think to get it right next time\",\n"
+            "      \"memory_tip\": \"short tip\"\n"
+            "    }\n"
+            "  ],\n"
+            "  \"overall_understanding_summary\": \"overall topic-level understanding summary\",\n"
+            "  \"improvement_plan\": [\"3-6 prioritized actions\"],\n"
+            "  \"recommendations\": [\"2-5 recommendations\"]\n"
+            "}\n"
+            "If evidence is insufficient for any field, still provide best-effort but avoid saying unknown.\n"
+            f"Input JSON:\n{json.dumps(prompt_payload, ensure_ascii=True)}"
+        )
+
+        retries = _llm_max_retries()
+        for attempt in range(retries + 1):
+            try:
+                response = model.generate_content(prompt)
+                parsed = _extract_json_object(getattr(response, "text", ""))
+                if not isinstance(parsed, dict):
+                    return None
+                return parsed
+            except Exception as exc:
+                message = str(exc)
+                if _is_quota_error(message):
+                    delay = _retry_delay_from_error(message) or _llm_cooldown_seconds()
+                    _start_llm_cooldown(delay)
+                    logger.warning("LLM quota/rate-limit hit. Cooldown started for %ss.", delay)
+                    return None
+                if attempt < retries:
+                    wait_seconds = _llm_backoff_seconds() * (2 ** attempt)
+                    if wait_seconds > 0:
+                        time.sleep(wait_seconds)
+                    continue
+                raise
+    except Exception as exc:
+        logger.warning("LLM semantic analysis failed: %s", exc)
+        return None
 
 
 def _normalize_text(value):
     return str(value or "").strip()
 
 
-def _clean_pattern_list(patterns, empty_message):
-    cleaned = []
-    seen = set()
-    invalid = {
-        NO_CONCEPT_PATTERN_MESSAGE.lower(),
-        NO_BEHAVIOR_PATTERN_MESSAGE.lower(),
-        NO_REVIEW_MESSAGE.lower(),
-        "",
-    }
+def _format_subject_insights(subject_insights):
+    if not subject_insights:
+        return ""
 
-    for pattern in patterns or []:
-        line = _normalize_text(pattern)
-        if line.startswith("*"):
-            line = f"- {line[1:].strip()}"
-        elif not line.startswith("-"):
-            line = f"- {line.lstrip('- ').strip()}"
+    if isinstance(subject_insights, dict):
+        preferred_order = [
+            "avg_score",
+            "recent_score",
+            "strengths",
+            "weak_topics",
+            "critical_weak_areas",
+            "conceptual_mistakes",
+            "behavior_patterns",
+            "mastery_summary",
+            "personalized_feedback",
+            "improvement_plan",
+            "practice_questions",
+            "comprehensive_analysis",
+        ]
+        lines = []
+        handled = set()
 
-        key = line[1:].strip().lower() if line.startswith("-") else line.lower()
-        if key in invalid:
-            continue
-        if key in seen:
-            continue
-        seen.add(key)
-        cleaned.append(line)
+        def _append_line(label, value):
+            cleaned = _normalize_text(value)
+            if cleaned:
+                lines.append(f"{label}: {cleaned}")
 
-    return cleaned if cleaned else [empty_message]
+        for key in preferred_order:
+            if key not in subject_insights:
+                continue
+            value = subject_insights.get(key)
+            handled.add(key)
+            if isinstance(value, list):
+                flattened = ", ".join(_normalize_text(item) for item in value if _normalize_text(item))
+                _append_line(key.replace("_", " ").title(), flattened)
+            elif isinstance(value, dict):
+                flattened = ", ".join(
+                    f"{_normalize_text(item_key)}={_normalize_text(item_value)}"
+                    for item_key, item_value in value.items()
+                    if _normalize_text(item_key) and _normalize_text(item_value)
+                )
+                _append_line(key.replace("_", " ").title(), flattened)
+            else:
+                _append_line(key.replace("_", " ").title(), value)
 
+        for key, value in subject_insights.items():
+            if key in handled:
+                continue
+            if isinstance(value, list):
+                flattened = ", ".join(_normalize_text(item) for item in value if _normalize_text(item))
+                _append_line(str(key).replace("_", " ").title(), flattened)
+            elif isinstance(value, dict):
+                flattened = ", ".join(
+                    f"{_normalize_text(item_key)}={_normalize_text(item_value)}"
+                    for item_key, item_value in value.items()
+                    if _normalize_text(item_key) and _normalize_text(item_value)
+                )
+                _append_line(str(key).replace("_", " ").title(), flattened)
+            else:
+                _append_line(str(key).replace("_", " ").title(), value)
 
-def _extract_bullets_only(text, max_items, empty_message):
-    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
-    bullets = []
-    for line in lines:
-        if line.startswith("-"):
-            bullets.append(line)
-        elif line.startswith("*"):
-            bullets.append(f"- {line[1:].strip()}")
-    return _clean_pattern_list(bullets[:max_items], empty_message)
+        return "\n".join(lines)
 
+    if isinstance(subject_insights, list):
+        return "\n".join(f"- {_normalize_text(item)}" for item in subject_insights if _normalize_text(item))
 
-def _looks_generic_concept_response(bullets):
-    generic_phrases = [
-        "narrow down the options",
-        "switch away from the correct line of thinking",
-        "familiar-looking options",
-        "some of the misses are on short, direct questions",
-        "underlying concept",
-        "what the question is actually asking",
-        "conceptual understanding",
-        "uncertainty in the underlying concept",
-        "same wrong idea",
-    ]
-    text = " ".join(str(item or "").lower() for item in bullets or [])
-    return any(phrase in text for phrase in generic_phrases)
-
-
-def _option_label(option_key, options):
-    if not isinstance(options, dict):
-        return str(option_key or "").strip()
-    label = str(options.get(str(option_key), "") or "").strip()
-    if label:
-        return f"{str(option_key).strip()} - {label}"
-    return str(option_key or "").strip()
-
-
-def _mcq_concept_frame(question):
-    options = question.get("options") or {}
-    selected = _normalize_text(question.get("selected_answer"))
-    correct = _normalize_text(question.get("correct_answer"))
-    question_text = _normalize_text(question.get("question_text"))
-
-    selected_text = _normalize_text(options.get(selected, "")) if isinstance(options, dict) else ""
-    correct_text = _normalize_text(options.get(correct, "")) if isinstance(options, dict) else ""
-
-    if selected and correct and (selected_text or correct_text):
-        return (
-            f"you chose option {selected}{f' ({selected_text})' if selected_text else ''}, "
-            f"but the correct choice is option {correct}{f' ({correct_text})' if correct_text else ''}"
-        )
-    if selected and correct:
-        return f"you chose option {selected}, but the correct choice is option {correct}"
-    if selected_text and correct_text:
-        return f"you chose '{selected_text}', but the correct choice is '{correct_text}'"
-    if question_text:
-        return f"this question asks: {question_text[:100]}"
-    return "the selected option does not match the concept tested by the question"
+    return _normalize_text(subject_insights)
 
 
-def _behavior_summary(questions_data):
-    timed_questions = []
-    for question in questions_data or []:
-        try:
-            time_taken = max(0, int(question.get("time_taken_seconds", 0) or 0))
-        except Exception:
-            time_taken = 0
-        if time_taken > 0:
-            timed_questions.append(time_taken)
-
-    total_questions = len(questions_data or [])
-    incorrect_count = sum(1 for question in questions_data or [] if not question.get("is_correct", False))
-    changed_count = sum(1 for question in questions_data or [] if question.get("answer_changed"))
-
-    if not timed_questions:
-        return {
-            "timed_questions": [],
-            "avg_time": 0,
-            "total_time": 0,
-            "incorrect_count": incorrect_count,
-            "changed_count": changed_count,
-            "wrong_rate": 0,
-            "compressed_attempt": False,
-        }
-
-    avg_time = sum(timed_questions) / len(timed_questions)
-    wrong_rate = incorrect_count / total_questions if total_questions else 0
-    compressed_attempt = (
-        len(timed_questions) >= 5
-        and avg_time <= 18
-        and wrong_rate >= 0.6
-        and changed_count <= 1
+def _contains_negation(question_text):
+    text = f" {_normalize_text(question_text).lower()} "
+    markers = (
+        " not ",
+        " except ",
+        " least ",
+        " false ",
+        " incorrect ",
+        " never ",
+        " cannot ",
+        "n't ",
     )
+    return any(marker in text for marker in markers)
+
+
+def _normalize_review_row(row, index):
+    if not isinstance(row, dict):
+        return None
+
+    question_id = row.get("question_id", row.get("id", index))
+    question_text = row.get("question_text") or row.get("question") or row.get("question_label") or ""
+    student_answer = row.get("student_answer", row.get("selected_answer", row.get("answer", "")))
+    correct_answer = row.get("correct_answer", row.get("expected_answer", ""))
+    topic = row.get("topic", row.get("subject", "General"))
+    subtopic = row.get("subtopic", row.get("sub_topic", row.get("topic_detail", "")))
+
+    try:
+        time_taken_seconds = max(0, int(row.get("time_taken_seconds", row.get("response_time", 0)) or 0))
+    except (TypeError, ValueError):
+        time_taken_seconds = 0
 
     return {
-        "timed_questions": timed_questions,
-        "avg_time": avg_time,
-        "total_time": sum(timed_questions),
-        "incorrect_count": incorrect_count,
-        "changed_count": changed_count,
-        "wrong_rate": wrong_rate,
-        "compressed_attempt": compressed_attempt,
+        "question_id": question_id,
+        "question_text": _normalize_text(question_text),
+        "student_answer": _normalize_text(student_answer),
+        "correct_answer": _normalize_text(correct_answer),
+        "topic": _normalize_text(topic) or "General",
+        "subtopic": _normalize_text(subtopic),
+        "time_taken_seconds": time_taken_seconds,
+        "answer_changed": bool(row.get("answer_changed", False)),
+        "difficulty": _normalize_text(row.get("difficulty", row.get("level", "Medium"))) or "Medium",
+        "options": row.get("options", {}),
     }
 
 
-def _heuristic_conceptual_mistakes(questions_data):
-    incorrect = [q for q in questions_data if not q.get("is_correct", False)]
-    if len(incorrect) < MIN_INCORRECT_FOR_CONCEPT:
-        return [NO_CONCEPT_PATTERN_MESSAGE]
+def _topic_display(topic, subtopic):
+    topic = _normalize_text(topic) or "General"
+    subtopic = _normalize_text(subtopic)
+    return f"{topic} - {subtopic}" if subtopic else topic
 
-    bullets = []
-    topic_buckets = {}
-    same_answer_groups = {}
-    mcq_rows = []
-    for index, question in enumerate(incorrect, start=1):
-        selected = _normalize_text(question.get("selected_answer")).lower()
-        correct = _normalize_text(question.get("correct_answer")).lower()
-        topic = _normalize_topic(question.get("topic"))
-        key = (selected, correct)
-        same_answer_groups.setdefault(key, []).append(topic)
-        topic_buckets.setdefault(topic, []).append((index, question))
-        if str(question.get("question_type", "")).strip().upper() == "MCQ" or question.get("options"):
-            mcq_rows.append((index, question))
 
-    def _question_snippet(question):
-        text = _normalize_text(question.get("question_text"))
-        if not text:
-            return "this question"
-        return text if len(text) <= 90 else f"{text[:87]}..."
+def _classify_mistake(row, topic_stats):
+    topic = row["topic"]
+    topic_accuracy = topic_stats.get(topic, {}).get("accuracy", 0)
+    student_answer = row["student_answer"]
+    time_taken_seconds = int(row.get("time_taken_seconds", 0) or 0)
+    question_text = row["question_text"]
 
-    repeated_choice_confusion = [
-        (key, topics)
-        for key, topics in same_answer_groups.items()
-        if key[0] and key[1] and len(topics) >= 2
-    ]
-    if repeated_choice_confusion:
-        (selected, correct), topics = repeated_choice_confusion[0]
-        topic_label = _normalize_text(topics[0]) if topics else "these topics"
-        bullets.append(
-            f"- In multiple {topic_label} questions, you are choosing '{selected}' when the correct answer is '{correct}'. That points to one repeated misconception rather than random guessing."
+    if not student_answer:
+        return (
+            "Guessing",
+            "No answer was provided, so there is no reasoning to check.",
         )
 
-    if mcq_rows:
-        option_insights = []
-        for index, question in mcq_rows[:4]:
-            frame = _mcq_concept_frame(question)
-            topic = _normalize_topic(question.get("topic"))
-            question_text = _normalize_text(question.get("question_text"))
-            prefix = f"Q{index} ({topic})"
-            if question_text:
-                prefix += f" - '{question_text[:70] + ('...' if len(question_text) > 70 else '')}'"
-            option_insights.append(f"{prefix}: {frame}")
-
-        if option_insights:
-            bullets.append(
-                "- Decision-making evidence from your MCQ choices: "
-                + "; ".join(option_insights[:2])
-                + "."
-            )
-            selected_examples = []
-            for index, question in mcq_rows[:3]:
-                selected = _normalize_text(question.get("selected_answer"))
-                correct = _normalize_text(question.get("correct_answer"))
-                options = question.get("options") or {}
-                selected_text = _normalize_text(options.get(selected, "")) if isinstance(options, dict) else ""
-                correct_text = _normalize_text(options.get(correct, "")) if isinstance(options, dict) else ""
-                if selected_text and correct_text:
-                    selected_examples.append(
-                        f"Q{index}: option {selected} ({selected_text}) vs option {correct} ({correct_text})"
-                    )
-                elif selected and correct:
-                    selected_examples.append(f"Q{index}: option {selected} vs option {correct}")
-
-            if selected_examples:
-                bullets.append(
-                    "- MCQ choice logic is the main issue here: "
-                    + "; ".join(selected_examples[:2])
-                    + ". That means the problem is not writing an answer, but deciding which option actually matches the concept."
-                )
-            first_index, first_question = mcq_rows[0]
-            first_topic = _normalize_topic(first_question.get("topic"))
-            first_question_text = _normalize_text(first_question.get("question_text"))
-            first_selected = _normalize_text(first_question.get("selected_answer"))
-            first_correct = _normalize_text(first_question.get("correct_answer"))
-            first_options = first_question.get("options") or {}
-            selected_text = _normalize_text(first_options.get(first_selected, "")) if isinstance(first_options, dict) else ""
-            correct_text = _normalize_text(first_options.get(first_correct, "")) if isinstance(first_options, dict) else ""
-            bullets.append(
-                f"- In Q{first_index} ({first_topic}), the question tests a specific condition, but your selected option {first_selected or '[blank]'}"
-                + (f" ({selected_text})" if selected_text else "")
-                + " aligns with a related idea, not the exact requirement. "
-                + f"The correct option {first_correct or '[blank]'}"
-                + (f" ({correct_text})" if correct_text else "")
-                + " is right because it directly satisfies that condition"
-                + (f" in '{first_question_text[:80] + ('...' if len(first_question_text) > 80 else '')}'" if first_question_text else "")
-                + "."
-            )
-
-    changed_wrong = sum(1 for question in incorrect if question.get("answer_changed"))
-    if changed_wrong >= 2:
-        changed_examples = [
-            f"Q{index} ({_normalize_topic(question.get('topic'))}) - '{_question_snippet(question)}'"
-            for index, question in enumerate(incorrect, start=1)
-            if question.get("answer_changed")
-        ][:2]
-        example_text = f" Examples: {'; '.join(changed_examples)}." if changed_examples else ""
-        bullets.append(
-            f"- You are changing answers after narrowing down choices, which shows hesitation rather than settled concept knowledge.{example_text}"
+    if _contains_negation(question_text):
+        return (
+            "Misinterpretation",
+            "The question uses negation or exception wording, which is easy to read incorrectly.",
         )
 
-    difficulty_wrong = {"easy": 0, "medium": 0, "hard": 0}
-    for question in incorrect:
-        difficulty_wrong[_normalize_difficulty(question.get("difficulty"))] += 1
-
-    if difficulty_wrong["easy"] >= 2:
-        easy_examples = [
-            f"Q{index} ({_normalize_topic(question.get('topic'))}) - '{_question_snippet(question)}'"
-            for index, question in enumerate(incorrect, start=1)
-            if _normalize_difficulty(question.get("difficulty")) == "easy"
-        ][:2]
-        example_text = f" Examples: {'; '.join(easy_examples)}." if easy_examples else ""
-        bullets.append(
-            f"- Some mistakes are happening on simpler questions too, so the issue looks conceptual and foundational rather than just exam pressure.{example_text}"
+    if row.get("answer_changed") and time_taken_seconds and time_taken_seconds < 20:
+        return (
+            "Careless Mistake",
+            "The answer was changed or rushed, which points to a quick final choice instead of careful checking.",
         )
 
-    if mcq_rows:
-        concept_pairs = []
-        for _, question in mcq_rows:
-            selected = _normalize_text(question.get("selected_answer"))
-            correct = _normalize_text(question.get("correct_answer"))
-            options = question.get("options") or {}
-            selected_text = _normalize_text(options.get(selected, "")) if isinstance(options, dict) else ""
-            correct_text = _normalize_text(options.get(correct, "")) if isinstance(options, dict) else ""
-            if selected and correct and selected != correct:
-                concept_pairs.append((selected_text or selected, correct_text or correct))
-
-        if concept_pairs:
-            sample_wrong, sample_right = concept_pairs[0]
-            bullets.append(
-                f"- Your MCQ pattern suggests you are mixing up {sample_wrong} with {sample_right}. The wrong option looks familiar, but the stem is testing the finer distinction between those two ideas."
-            )
-
-    return _clean_pattern_list(bullets[:4], NO_CONCEPT_PATTERN_MESSAGE)
-
-
-def _heuristic_test_behavior(questions_data):
-    if len(questions_data) < MIN_QUESTIONS_FOR_BEHAVIOR:
-        return [NO_BEHAVIOR_PATTERN_MESSAGE]
-
-    bullets = []
-
-    def _tts(question):
-        try:
-            return max(0, int(question.get("time_taken_seconds", 0) or 0))
-        except Exception:
-            return 0
-
-    timed_questions = [question for question in questions_data if _tts(question) > 0]
-    if len(timed_questions) < MIN_QUESTIONS_FOR_BEHAVIOR:
-        return [NO_BEHAVIOR_PATTERN_MESSAGE]
-
-    summary = _behavior_summary(questions_data)
-    total_time = summary["total_time"]
-    avg_time = summary["avg_time"]
-    if avg_time <= 0:
-        return [NO_BEHAVIOR_PATTERN_MESSAGE]
-
-    rush_threshold = avg_time * 0.5
-    slow_threshold = avg_time * 1.6
-
-    fast_wrong = [
-        question for question in timed_questions
-        if not question.get("is_correct", False) and _tts(question) < rush_threshold
-    ]
-    slow_wrong = [
-        question for question in timed_questions
-        if not question.get("is_correct", False) and _tts(question) > slow_threshold
-    ]
-    changed_count = sum(1 for question in timed_questions if question.get("answer_changed"))
-
-    if len(fast_wrong) >= 2:
-        bullets.append("- You are answering too quickly on several questions and getting them wrong.")
-
-    if summary["compressed_attempt"]:
-        bullets.append(
-            "- You moved through most of the paper in one quick pass without slowing down to check your thinking, and that rushed approach is showing up in the wrong answers."
+    if time_taken_seconds >= 90:
+        return (
+            "Logic Error",
+            "The question took a long time, but the final reasoning still led to the wrong answer.",
         )
 
-    if len(slow_wrong) >= 2:
-        bullets.append("- You are spending much longer on several questions without getting better results.")
-
-    if changed_count >= max(2, len(timed_questions) // 3):
-        bullets.append("- You are changing answers often, which suggests hesitation during the test.")
-
-    by_difficulty = {"easy": [], "medium": [], "hard": []}
-    for question in timed_questions:
-        by_difficulty[_normalize_difficulty(question.get("difficulty"))].append(_tts(question))
-
-    if by_difficulty["easy"] and by_difficulty["hard"]:
-        easy_avg = sum(by_difficulty["easy"]) / len(by_difficulty["easy"])
-        hard_avg = sum(by_difficulty["hard"]) / len(by_difficulty["hard"])
-        if hard_avg < easy_avg * 0.85:
-            bullets.append("- Your pacing across difficulty levels looks uneven, especially on harder questions.")
-
-    return _clean_pattern_list(bullets[:4], NO_BEHAVIOR_PATTERN_MESSAGE)
-
-
-def analyze_conceptual_mistakes(questions_data):
-    """
-    Detect repeated conceptual patterns from incorrect answers only.
-    """
-    if not questions_data:
-        return [NO_REVIEW_MESSAGE]
-
-    incorrect = [q for q in questions_data if not q.get("is_correct", False)]
-    if len(incorrect) < MIN_INCORRECT_FOR_CONCEPT:
-        return [NO_CONCEPT_PATTERN_MESSAGE]
-
-    prepared = []
-    for question in incorrect[:MAX_INCORRECT_FOR_AI]:
-        prepared.append({
-            "topic": _normalize_topic(question.get("topic")),
-            "question_text": _normalize_text(question.get("question_text"))[:300],
-            "selected_answer": _normalize_text(question.get("selected_answer")),
-            "correct_answer": _normalize_text(question.get("correct_answer")),
-            "difficulty": _normalize_difficulty(question.get("difficulty")),
-            "answer_changed": bool(question.get("answer_changed")),
-        })
-
-    try:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            return _heuristic_conceptual_mistakes(prepared)
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config={"temperature": 0.2},
+    if topic_accuracy <= 50:
+        return (
+            "Conceptual Error",
+            f"This topic is still weak overall ({topic_accuracy}% correct), so the core idea likely needs revision.",
         )
 
-        failures_text = ""
-        for idx, question in enumerate(prepared, 1):
-            failures_text += (
-                f"\n{idx}. Topic: {question['topic']}\n"
-                f"   Question: {question['question_text']}\n"
-                f"   Student answer: {question['selected_answer'] or 'No answer'}\n"
-                f"   Correct answer: {question['correct_answer'] or 'Not available'}\n"
-                f"   Difficulty: {question['difficulty']}\n"
-                f"   Answer changed: {'yes' if question['answer_changed'] else 'no'}\n"
-            )
-
-        prompt = f"""You are analyzing a student's incorrect answers from a real test.
-
-Your goal is NOT to summarize mistakes.
-Your goal is to deeply understand HOW the student is thinking wrong.
-INPUT:
-You will receive incorrect responses with:
-- question_text
-- selected_answer
-- correct_answer
-- topic
-- question_type
-- options when available
-3. Identify the thinking error behind the mistake.
-
-- Only report a pattern if there is enough evidence across multiple incorrect answers.
-- Every bullet must reference the student's actual answer sheet evidence, such as a question theme, the selected answer, the correct answer, or a clear answer-change pattern.
-- For MCQs, analyze decision-making: explain why the selected option looked attractive, why the correct option is better, and what concept distinction was missed.
-- Do not write generic 'revise the topic' language for MCQs.
-- If options are provided, use them to explain the trap or misconception behind the wrong choice.
-
-You must:
-- Identify what the student misunderstood conceptually.
-- Explain how the student is thinking incorrectly.
-- Detect confusion between similar concepts.
-- Detect repeated use of wrong logic.
-- Detect when the student is misreading or misinterpreting questions.
-
-OUTPUT STYLE:
-- Maximum 4 bullet points.
-- Every bullet must start with "-".
-- Each bullet must feel like a human teacher observation.
-- Each bullet must explain a real reasoning mistake.
-- Each bullet must connect multiple questions into one insight.
-- Use natural, human, slightly conversational language.
-
-EDGE CASE:
-If there are not enough meaningful mistakes, return exactly:
-{NO_CONCEPT_PATTERN_MESSAGE}
-
-Incorrect answers:
-{failures_text}
-"""
-
-        response = model.generate_content(prompt)
-        result = getattr(response, "text", "").strip()
-        parsed = _extract_bullets_only(result, 4, NO_CONCEPT_PATTERN_MESSAGE)
-        if parsed != [NO_CONCEPT_PATTERN_MESSAGE] and not _looks_generic_concept_response(parsed):
-            return parsed
-        return _heuristic_conceptual_mistakes(prepared)
-    except Exception:
-        return _heuristic_conceptual_mistakes(prepared)
-
-
-def analyze_test_behavior(questions_data):
-    """
-    Detect repeated behavior patterns from question timing and response actions.
-    """
-    if not questions_data:
-        return [NO_REVIEW_MESSAGE]
-
-    prepared = []
-    for question in questions_data:
-        prepared.append({
-            "is_correct": bool(question.get("is_correct", False)),
-            "time_taken_seconds": max(0, int(question.get("time_taken_seconds", 0) or 0)),
-            "answer_changed": bool(question.get("answer_changed", False)),
-            "difficulty": _normalize_difficulty(question.get("difficulty")),
-            "topic": _normalize_topic(question.get("topic")),
-        })
-
-    if len(prepared) < MIN_QUESTIONS_FOR_BEHAVIOR:
-        return [NO_BEHAVIOR_PATTERN_MESSAGE]
-
-    try:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            return _heuristic_test_behavior(prepared)
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config={"temperature": 0.2},
+    if row.get("difficulty", "").lower() == "hard" and topic_accuracy < 75:
+        return (
+            "Logic Error",
+            "The topic is partly understood, but the harder question exposed a reasoning gap.",
         )
 
-        timed = [q["time_taken_seconds"] for q in prepared if q["time_taken_seconds"] > 0]
-        if len(timed) < MIN_QUESTIONS_FOR_BEHAVIOR:
-            return [NO_BEHAVIOR_PATTERN_MESSAGE]
-
-        summary = _behavior_summary(prepared)
-        avg_time = summary["avg_time"]
-        overall_pace = (
-            "very compressed"
-            if summary["compressed_attempt"]
-            else "steady"
-        )
-        behavior_text = ""
-        for idx, question in enumerate(prepared, 1):
-            behavior_text += (
-                f"\n{idx}. Topic: {question['topic']}"
-                f" | Difficulty: {question['difficulty']}"
-                f" | Correct: {'yes' if question['is_correct'] else 'no'}"
-                f" | Relative pace: "
-                f"{'faster than usual' if question['time_taken_seconds'] and question['time_taken_seconds'] < avg_time * 0.5 else 'slower than usual' if question['time_taken_seconds'] > avg_time * 1.6 else 'near usual pace'}"
-                f" | Answer changed: {'yes' if question['answer_changed'] else 'no'}"
-            )
-
-        prompt = f"""You are analyzing student test-taking behavior in an academic testing platform.
-
-Your job is to detect only repeated behavior patterns.
-
-Important rules:
-- Only report a pattern if it repeats across multiple questions.
-- Do not mention exact numbers, timings, marks, or statistics.
-- Do not give generic advice.
-- Use simple student-friendly language.
-- If the whole attempt looks very compressed for the number of questions and many answers are wrong, treat that as a meaningful rushing pattern even when the student is internally consistent.
-- If there is not enough evidence for a strong repeated pattern, return exactly:
-{NO_BEHAVIOR_PATTERN_MESSAGE}
-
-Overall attempt pacing: {overall_pace}
-
-Behavior data:
-{behavior_text}
-
-Return format:
-- One bullet per repeated pattern
-- Maximum 4 bullets
-- Every line must start with "-"
-- Each bullet must describe a repeated behavior pattern clearly
-"""
-
-        response = model.generate_content(prompt)
-        result = getattr(response, "text", "").strip()
-        parsed = _extract_bullets_only(result, 4, NO_BEHAVIOR_PATTERN_MESSAGE)
-        return parsed if parsed != [NO_BEHAVIOR_PATTERN_MESSAGE] else _heuristic_test_behavior(prepared)
-    except Exception:
-        return _heuristic_test_behavior(prepared)
-
-
-def build_ai_tutor_context(student_name, subjects_with_data):
     return (
-        f"You are a personalized AI Tutor helping {student_name} improve academically.\n\n"
-        "You must behave like a pattern detection engine.\n"
-        "Only describe repeated and meaningful patterns.\n"
-        "Never invent insights when evidence is weak.\n"
-        "Do not mention marks, percentages, or raw statistics inside insight bullets.\n"
-        "Keep the language clear, supportive, and student-friendly."
+        "Careless Mistake",
+        "The concept seems partly known, but the final choice was not checked carefully enough.",
     )
 
 
-def build_student_context(name, class_name, structured_marks, gender=None, parent_number=None, subject_focus=None, subject_insights=None):
-    """
-    Build focused tutoring context while still allowing concept explanations and follow-up questions.
-    """
+def _memory_tip(label):
+    tips = {
+        "Conceptual Error": "Re-learn the definition first, then solve one easy example.",
+        "Careless Mistake": "Slow down, read the final option again, and re-check before submitting.",
+        "Misinterpretation": "Circle words like not, except, least, and false before choosing an answer.",
+        "Logic Error": "Write the steps in order before selecting the answer.",
+        "Guessing": "Eliminate impossible options first, then make the safest choice.",
+    }
+    return tips.get(label, "Review the concept, then try one similar question.")
+
+
+def _practice_question(topic, subtopic, difficulty="Easy"):
+    focus = _topic_display(topic, subtopic)
+    if difficulty == "Medium":
+        question = f"Apply the main idea of {focus} to a new example."
+    else:
+        question = f"What is the core idea of {focus}?"
+
+    return {
+        "topic": _normalize_text(topic) or "General",
+        "subtopic": _normalize_text(subtopic),
+        "difficulty": difficulty,
+        "question": question,
+        "hint": f"Start with the definition of {focus} and connect it to one simple example.",
+    }
+
+
+def analyze_test_submission(question_rows, student_name=None, test_name=None, subject_name=None, use_llm=True):
+    normalized_rows = []
+    for index, row in enumerate(question_rows or [], start=1):
+        normalized = _normalize_review_row(row, index)
+        if normalized:
+            normalized_rows.append(normalized)
+
+    total_questions = len(normalized_rows)
+    correct_rows = [row for row in normalized_rows if row["student_answer"] and row["student_answer"] == row["correct_answer"]]
+    wrong_rows = [row for row in normalized_rows if not row["student_answer"] or row["student_answer"] != row["correct_answer"]]
+
+    topic_stats = defaultdict(lambda: {
+        "total": 0,
+        "correct": 0,
+        "incorrect": 0,
+        "subtopics": Counter(),
+        "wrong_rows": [],
+    })
+
+    for row in normalized_rows:
+        topic = row["topic"]
+        stats = topic_stats[topic]
+        stats["total"] += 1
+        if row["subtopic"]:
+            stats["subtopics"][row["subtopic"]] += 1
+        if row["student_answer"] and row["student_answer"] == row["correct_answer"]:
+            stats["correct"] += 1
+        else:
+            stats["incorrect"] += 1
+            stats["wrong_rows"].append(row)
+
+    topic_summary = {}
+    strong_topics = []
+    weak_topics = []
+    critical_weak_areas = []
+
+    for topic, stats in topic_stats.items():
+        total = int(stats["total"])
+        correct = int(stats["correct"])
+        incorrect = int(stats["incorrect"])
+        accuracy = round((correct / total) * 100, 2) if total else 0
+        dominant_subtopic = stats["subtopics"].most_common(1)[0][0] if stats["subtopics"] else ""
+        topic_summary[topic] = {
+            "total": total,
+            "correct": correct,
+            "incorrect": incorrect,
+            "accuracy": accuracy,
+            "dominant_subtopic": dominant_subtopic,
+        }
+
+        entry = {
+            "topic": topic,
+            "subtopic": dominant_subtopic,
+            "total": total,
+            "correct": correct,
+            "incorrect": incorrect,
+            "accuracy": accuracy,
+        }
+        if accuracy >= 80 and total >= 2:
+            strong_topics.append(entry)
+        if incorrect > 0:
+            weak_topics.append(entry)
+        if incorrect >= 2 or accuracy <= 50:
+            critical_weak_areas.append(entry)
+
+    strong_topics.sort(key=lambda item: (-item["accuracy"], -item["correct"], item["topic"]))
+    weak_topics.sort(key=lambda item: (item["accuracy"], -item["incorrect"], item["topic"]))
+    critical_weak_areas.sort(key=lambda item: (item["accuracy"], -item["incorrect"], item["topic"]))
+
+    mistake_counter = Counter()
+    behavior_counter = Counter()
+    detailed_mistakes = []
+
+    for row in wrong_rows:
+        label, reason = _classify_mistake(row, topic_summary)
+        mistake_counter[label] += 1
+        if label in {"Careless Mistake", "Misinterpretation", "Guessing"}:
+            behavior_counter[label] += 1
+        else:
+            behavior_counter["Concept/Reasoning"] += 1
+
+        detailed_mistakes.append({
+            "question_id": row["question_id"],
+            "question": row["question_text"],
+            "student_answer": row["student_answer"] or "No answer provided",
+            "correct_answer": row["correct_answer"],
+            "topic": row["topic"],
+            "subtopic": row["subtopic"],
+            "classification": label,
+            "what_student_did_wrong": f"The response for {_topic_display(row['topic'], row['subtopic'])} did not match the correct answer.",
+            "why_it_is_wrong": reason,
+            "correct_concept": f"The correct answer is {row['correct_answer']}. Revisit the main rule or definition for {_topic_display(row['topic'], row['subtopic'])}.",
+            "simple_explanation": f"Think of {_topic_display(row['topic'], row['subtopic'])} as the key idea you need to recognize before answering.",
+            "memory_tip": _memory_tip(label),
+        })
+
+    repeated_weaknesses = []
+    for topic, stats in topic_summary.items():
+        if stats["incorrect"] >= 2:
+            repeated_weaknesses.append({
+                "type": "Topic",
+                "label": topic,
+                "count": stats["incorrect"],
+                "message": f"{topic} is a repeated weak area with {stats['incorrect']} wrong answer(s).",
+                "comparison": f"Accuracy in {topic} is only {stats['accuracy']}%, so the same concept is being missed again.",
+                "extra_attention_note": f"Spend extra time on {topic} before moving to the next topic.",
+            })
+
+    for label, count in mistake_counter.items():
+        if count >= 2:
+            repeated_weaknesses.append({
+                "type": "Mistake Pattern",
+                "label": label,
+                "count": count,
+                "message": f"{label} happened {count} times.",
+                "comparison": "This shows the same thinking pattern is repeating across more than one question.",
+                "extra_attention_note": _memory_tip(label),
+            })
+
+    repeated_weakness = repeated_weaknesses[0] if repeated_weaknesses else None
+
+    total_attempted = sum(1 for row in normalized_rows if row["student_answer"])
+    accuracy = round((len(correct_rows) / total_questions) * 100, 2) if total_questions else 0
+
+    performance_summary = {
+        "student_name": _normalize_text(student_name),
+        "test_name": _normalize_text(test_name),
+        "subject_name": _normalize_text(subject_name),
+        "total_questions": total_questions,
+        "correct": len(correct_rows),
+        "incorrect": len(wrong_rows),
+        "attempted": total_attempted,
+        "unattempted": max(0, total_questions - total_attempted),
+        "accuracy": accuracy,
+    }
+
+    concept_patterns = []
+    for entry in critical_weak_areas[:5]:
+        concept_patterns.append(
+            f"{entry['topic']} needs revision ({entry['correct']}/{entry['total']} correct)."
+        )
+    if not concept_patterns and strong_topics:
+        concept_patterns.append(f"{strong_topics[0]['topic']} is a strength with {strong_topics[0]['accuracy']}% accuracy.")
+
+    behavior_patterns = []
+    if mistake_counter["Guessing"]:
+        behavior_patterns.append(f"Guessing detected on {mistake_counter['Guessing']} question(s).")
+    if mistake_counter["Careless Mistake"]:
+        behavior_patterns.append(f"Rushing or weak checking affected {mistake_counter['Careless Mistake']} question(s).")
+    if mistake_counter["Misinterpretation"]:
+        behavior_patterns.append(f"Question wording was misread on {mistake_counter['Misinterpretation']} question(s).")
+    if mistake_counter["Logic Error"]:
+        behavior_patterns.append(f"Reasoning broke down on {mistake_counter['Logic Error']} question(s).")
+    if not behavior_patterns:
+        behavior_patterns.append("No repeated behavior pattern was detected.")
+
+    llm_topic_summaries = []
+    llm_result = None
+    if use_llm and wrong_rows:
+        llm_result = _run_llm_semantic_analysis(
+            wrong_rows,
+            student_name=student_name,
+            test_name=test_name,
+            subject_name=subject_name,
+        )
+        if isinstance(llm_result, dict):
+            llm_concepts = [
+                _normalize_text(item)
+                for item in llm_result.get("conceptual_patterns", [])
+                if _normalize_text(item)
+            ]
+            if llm_concepts:
+                concept_patterns = llm_concepts
+
+            llm_behaviors = [
+                _normalize_text(item)
+                for item in llm_result.get("behavior_patterns", [])
+                if _normalize_text(item)
+            ]
+            if llm_behaviors:
+                behavior_patterns = llm_behaviors
+
+            topic_summaries = llm_result.get("topic_summaries", [])
+            if isinstance(topic_summaries, list):
+                for summary in topic_summaries:
+                    if not isinstance(summary, dict):
+                        continue
+                    topic_name = _normalize_text(summary.get("topic"))
+                    understanding = _normalize_text(summary.get("understanding_summary"))
+                    cross_pattern = _normalize_text(summary.get("cross_question_pattern"))
+                    misconceptions = [
+                        _normalize_text(item)
+                        for item in summary.get("key_misconceptions", [])
+                        if _normalize_text(item)
+                    ]
+                    if topic_name or understanding or cross_pattern or misconceptions:
+                        llm_topic_summaries.append({
+                            "topic": topic_name,
+                            "understanding_summary": understanding,
+                            "cross_question_pattern": cross_pattern,
+                            "key_misconceptions": misconceptions,
+                        })
+
+            detailed_items = llm_result.get("detailed_mistakes", [])
+            llm_detail_map = {}
+            if isinstance(detailed_items, list):
+                for detail in detailed_items:
+                    if not isinstance(detail, dict):
+                        continue
+                    qid = _normalize_text(detail.get("question_id"))
+                    if not qid:
+                        continue
+                    llm_detail_map[qid] = detail
+
+            if llm_detail_map:
+                allowed_labels = {
+                    "Conceptual Error",
+                    "Careless Mistake",
+                    "Misinterpretation",
+                    "Logic Error",
+                    "Guessing",
+                }
+                for item in detailed_mistakes:
+                    qid = _normalize_text(item.get("question_id"))
+                    llm_item = llm_detail_map.get(qid)
+                    if not llm_item:
+                        continue
+                    llm_label = _normalize_text(llm_item.get("classification"))
+                    if llm_label in allowed_labels:
+                        item["classification"] = llm_label
+                    why_student = _normalize_text(llm_item.get("why_student_chose_this"))
+                    why_wrong = _normalize_text(llm_item.get("why_it_is_wrong"))
+                    correct_thinking = _normalize_text(llm_item.get("correct_thinking"))
+                    memory_tip = _normalize_text(llm_item.get("memory_tip"))
+                    if why_student:
+                        item["what_student_did_wrong"] = why_student
+                    if why_wrong:
+                        item["why_it_is_wrong"] = why_wrong
+                    if correct_thinking:
+                        item["correct_concept"] = correct_thinking
+                        item["simple_explanation"] = correct_thinking
+                    if memory_tip:
+                        item["memory_tip"] = memory_tip
+
+    strengths = []
+    if strong_topics:
+        for entry in strong_topics[:4]:
+            strengths.append(
+                f"{entry['topic']} looks strong with {entry['accuracy']}% accuracy."
+            )
+    elif accuracy >= 70:
+        strengths.append("You are showing a solid overall grasp of the test content.")
+    else:
+        strengths.append("There are still a few stable areas, but they are not strong enough to highlight yet.")
+
+    weaknesses = []
+    for entry in critical_weak_areas[:5]:
+        weaknesses.append(
+            f"{entry['topic']} needs more practice because {entry['incorrect']} question(s) were missed."
+        )
+    if not weaknesses and weak_topics:
+        weaknesses.append(f"{weak_topics[0]['topic']} is the main topic to review next.")
+
+    recommendations = []
+    if repeated_weakness:
+        recommendations.append(repeated_weakness["extra_attention_note"])
+    for entry in critical_weak_areas[:3]:
+        recommendations.append(f"Revisit {entry['topic']} and solve 3 easy practice questions.")
+    if not recommendations:
+        recommendations.append("Keep practicing mixed questions to protect your current accuracy.")
+
+    improvement_plan = []
+    for entry in critical_weak_areas[:3]:
+        improvement_plan.append(f"Revise {entry['topic']} using one short note and one solved example.")
+    if mistake_counter["Misinterpretation"]:
+        improvement_plan.append("Underline question words like not, except, least, and false before answering.")
+    if mistake_counter["Careless Mistake"]:
+        improvement_plan.append("Leave 10 seconds at the end to check your selected option again.")
+    if mistake_counter["Guessing"]:
+        improvement_plan.append("Eliminate obviously wrong options before choosing an answer.")
+    if not improvement_plan:
+        improvement_plan.append("Keep a steady revision routine and solve a short mixed quiz every day.")
+
+    if isinstance(llm_result, dict):
+        llm_plan = [
+            _normalize_text(item)
+            for item in llm_result.get("improvement_plan", [])
+            if _normalize_text(item)
+        ]
+        llm_recommendations = [
+            _normalize_text(item)
+            for item in llm_result.get("recommendations", [])
+            if _normalize_text(item)
+        ]
+        if llm_plan:
+            improvement_plan = llm_plan
+        if llm_recommendations:
+            recommendations = llm_recommendations
+
+    weak_topic_names = [entry["topic"] for entry in critical_weak_areas] or [entry["topic"] for entry in weak_topics]
+    practice_questions = []
+    seen_practice_topics = set()
+    for entry in critical_weak_areas:
+        if entry["topic"] in seen_practice_topics:
+            continue
+        seen_practice_topics.add(entry["topic"])
+        practice_questions.append(_practice_question(entry["topic"], entry["subtopic"], "Easy"))
+        if len(practice_questions) >= 5:
+            break
+    if len(practice_questions) < 2:
+        for entry in strong_topics:
+            if entry["topic"] in seen_practice_topics:
+                continue
+            practice_questions.append(_practice_question(entry["topic"], entry["subtopic"], "Medium"))
+            seen_practice_topics.add(entry["topic"])
+            if len(practice_questions) >= 2:
+                break
+
+    if not practice_questions:
+        practice_questions = [
+            _practice_question(subject_name or "General", "Core idea", "Easy"),
+            _practice_question(subject_name or "General", "Application", "Easy"),
+        ]
+
+    mastery_summary = (
+        f"{student_name or 'The student'} answered {len(correct_rows)} out of {total_questions} questions correctly "
+        f"({accuracy}%)."
+    )
+    if critical_weak_areas:
+        mastery_summary += f" The main revision focus is {critical_weak_areas[0]['topic']}."
+    elif strong_topics:
+        mastery_summary += f" The strongest area is {strong_topics[0]['topic']}."
+
+    if isinstance(llm_result, dict):
+        llm_summary = _normalize_text(llm_result.get("overall_understanding_summary"))
+        if llm_summary:
+            mastery_summary = llm_summary
+
+    comprehensive_analysis = [
+        f"Performance Summary: {len(correct_rows)}/{total_questions} correct ({accuracy}%).",
+        f"Topic Analysis: {', '.join(entry['topic'] for entry in strong_topics[:3]) or 'No strong topic yet'}.",
+        f"Weak Topics: {', '.join(entry['topic'] for entry in critical_weak_areas[:3]) or 'None detected'}.",
+        f"Repeated Weakness: {repeated_weakness['label']}" if repeated_weakness else "Repeated Weakness: None detected.",
+    ]
+
+    for summary in llm_topic_summaries[:5]:
+        topic = _normalize_text(summary.get("topic")) or "General"
+        understanding = _normalize_text(summary.get("understanding_summary"))
+        cross_pattern = _normalize_text(summary.get("cross_question_pattern"))
+        misconceptions = summary.get("key_misconceptions", [])
+
+        if understanding:
+            comprehensive_analysis.append(f"{topic} Understanding: {understanding}")
+        if cross_pattern:
+            comprehensive_analysis.append(f"{topic} Pattern: {cross_pattern}")
+        if misconceptions:
+            comprehensive_analysis.append(
+                f"{topic} Misconceptions: {', '.join(misconceptions[:3])}"
+            )
+
+    predicted_performance = {
+        "risk_level": "high" if accuracy < 50 else "medium" if accuracy < 75 else "low",
+        "focus_topics": weak_topic_names[:3],
+        "expected_next_step": "Revise weak topics before attempting mixed practice.",
+    }
+
+    return {
+        "performance_summary": performance_summary,
+        "topic_analysis": {
+            "by_topic": topic_summary,
+            "strong_topics": strong_topics,
+            "weak_topics": weak_topics,
+            "critical_weak_areas": critical_weak_areas,
+        },
+        "mistake_breakdown": {
+            "Conceptual Errors": mistake_counter["Conceptual Error"],
+            "Careless Mistakes": mistake_counter["Careless Mistake"],
+            "Misinterpretations": mistake_counter["Misinterpretation"],
+            "Logic Errors": mistake_counter["Logic Error"],
+            "Guessing": mistake_counter["Guessing"],
+            "Correct": len(correct_rows),
+            "Incorrect": len(wrong_rows),
+        },
+        "detailed_mistake_analysis": detailed_mistakes,
+        "repeated_weakness": repeated_weakness,
+        "personalized_feedback": " ".join([
+            f"{student_name or 'The student'} completed {test_name or 'the test'} with {accuracy}% accuracy.",
+            f"{mastery_summary}",
+        ]).strip(),
+        "improvement_plan": improvement_plan,
+        "practice_questions": practice_questions,
+        "strengths": strengths,
+        "weaknesses": weaknesses,
+        "recommendations": recommendations,
+        "mastery_summary": mastery_summary,
+        "conceptual_patterns": concept_patterns,
+        "behavior_patterns": behavior_patterns,
+        "comprehensive_analysis": comprehensive_analysis,
+        "predicted_performance": predicted_performance,
+    }
+
+
+def validate_analysis_report(report):
+    required_sections = [
+        "performance_summary",
+        "topic_analysis",
+        "mistake_breakdown",
+        "detailed_mistake_analysis",
+        "personalized_feedback",
+        "improvement_plan",
+        "practice_questions",
+    ]
+
+    missing_sections = [section for section in required_sections if section not in report]
+    detailed = report.get("detailed_mistake_analysis", []) if isinstance(report, dict) else []
+    breakdown = report.get("mistake_breakdown", {}) if isinstance(report, dict) else {}
+
+    issues = []
+    if not isinstance(detailed, list):
+        issues.append("detailed_mistake_analysis must be a list.")
+    if not isinstance(breakdown, dict):
+        issues.append("mistake_breakdown must be an object.")
+    if isinstance(detailed, list):
+        for idx, item in enumerate(detailed, start=1):
+            if not isinstance(item, dict):
+                issues.append(f"detailed_mistake_analysis[{idx}] must be an object.")
+                continue
+            for field in [
+                "what_student_did_wrong",
+                "why_it_is_wrong",
+                "correct_concept",
+                "simple_explanation",
+                "memory_tip",
+            ]:
+                if field not in item:
+                    issues.append(f"detailed_mistake_analysis[{idx}] is missing {field}.")
+
+    score = max(0, 100 - (len(missing_sections) * 15) - (len(issues) * 5))
+    return {
+        "is_valid": not missing_sections and not issues,
+        "coverage_score": score,
+        "missing_sections": missing_sections,
+        "issues": issues,
+    }
+
+
+def build_student_context(
+    name,
+    class_name,
+    structured_marks,
+    gender=None,
+    parent_number=None,
+    subject_focus=None,
+    subject_insights=None,
+):
+    """Build a compact chat context for student/teacher AI chat only."""
     if structured_marks:
         marks_table = "Subject | Test Name | Date | Score | Percent\n"
         marks_table += "-" * 60 + "\n"
@@ -571,7 +944,8 @@ def build_student_context(name, class_name, structured_marks, gender=None, paren
         marks_table = "No exam records available yet."
 
     subject_focus_text = f"\nCurrent Subject Focus: {subject_focus}" if subject_focus else ""
-    subject_insights_text = f"\n\nCurrent Subject Insights:\n{subject_insights}" if subject_insights else ""
+    formatted_subject_insights = _format_subject_insights(subject_insights)
+    subject_insights_text = f"\n\nCurrent Subject Insights:\n{formatted_subject_insights}" if formatted_subject_insights else ""
 
     return (
         f"You are a student-facing Academic Tutor AI helping {name} improve based on real test evidence.\n\n"
@@ -582,29 +956,16 @@ def build_student_context(name, class_name, structured_marks, gender=None, paren
         f"Parent Contact: {parent_number or 'N/A'}{subject_focus_text}\n\n"
         "Exam history:\n"
         f"{marks_table}{subject_insights_text}\n\n"
-        "Your responsibilities:\n"
-        "- Explain weak concepts related to the student's actual mistakes\n"
-        "- Answer follow-up questions about the student's weak topics and learning patterns\n"
-        "- Use the student's real academic data\n"
-        "- Stay specific, simple, and useful\n\n"
-        "Allowed:\n"
-        "- Explaining concepts related to mistakes\n"
-        "- Clarifying weak topics\n"
-        "- Suggesting focused next steps based on actual patterns\n"
-        "- Answering follow-up academic questions related to the same subjects\n\n"
-        "Not allowed:\n"
-        "- Unrelated chat, jokes, games, or off-topic discussion\n"
-        "- Made-up insights without evidence\n"
-        "- Generic filler advice\n\n"
-        "If the user asks something completely unrelated, respond with:\n"
-        "\"I'm here to help with your studies, mistakes, and weak topics. Ask me about a subject or pattern from your test data.\""
+        "Rules:\n"
+        "- Stay on academic topics only\n"
+        "- Use only the provided student data\n"
+        "- Keep response concise, specific, and actionable\n"
+        "- Avoid unrelated chat\n"
     )
 
 
 def chat_with_student_context(student_context, conversation_history):
-    """
-    Run tutoring chat with student context injected into history.
-    """
+    """Run chat with Gemini using prepared context and conversation history."""
     try:
         api_key = os.getenv("GOOGLE_API_KEY")
         if not api_key:
@@ -621,476 +982,56 @@ def chat_with_student_context(student_context, conversation_history):
             {
                 "role": "model",
                 "parts": [
-                    "Understood. I will help with this student's real mistakes, weak topics, and follow-up academic questions only."
+                    "Understood. I will provide focused academic help using only the provided data."
                 ],
             },
         ]
 
         for turn in conversation_history[:-1]:
-            context_history.append({
-                "role": turn["role"],
-                "parts": [turn["parts"][0]],
-            })
+            if not isinstance(turn, dict):
+                continue
+            role = turn.get("role")
+            parts = turn.get("parts")
+            if role not in {"user", "model"}:
+                continue
+            if not isinstance(parts, list) or not parts:
+                continue
+            context_history.append({"role": role, "parts": [str(parts[0])]})
+
+        latest_message = ""
+        if conversation_history and isinstance(conversation_history[-1], dict):
+            latest_parts = conversation_history[-1].get("parts")
+            if isinstance(latest_parts, list) and latest_parts:
+                latest_message = str(latest_parts[0])
 
         chat = model.start_chat(history=context_history)
-        latest_message = conversation_history[-1]["parts"][0]
         response = chat.send_message(latest_message)
-        return response.text
+        return _normalize_text(getattr(response, "text", "")) or "I could not generate a response."
     except Exception as exc:
+        logger.warning("Chat model call failed: %s", exc)
         return f"Error: {str(exc)}"
 
 
 def fallback_student_chat_response(student_name, subject_name, subject_insights, latest_message):
+    """Deterministic fallback if chat model is unavailable."""
     subject = _normalize_text(subject_name) or "this subject"
     insights = subject_insights if isinstance(subject_insights, dict) else {}
-    latest = _normalize_text(latest_message).lower()
 
     avg_score = insights.get("avg_score")
     recent_score = insights.get("recent_score")
-    conceptual = _clean_pattern_list(insights.get("conceptual_mistakes") or [], NO_CONCEPT_PATTERN_MESSAGE)
-    behavior = _clean_pattern_list(insights.get("behavior_patterns") or [], NO_BEHAVIOR_PATTERN_MESSAGE)
-
-    valid_concept = conceptual[0] if conceptual != [NO_CONCEPT_PATTERN_MESSAGE] else ""
-    valid_behavior = behavior[0] if behavior != [NO_BEHAVIOR_PATTERN_MESSAGE] else ""
 
     lines = [f"Here is a focused review for {subject}, {student_name}:"]
-
     if avg_score is not None and recent_score is not None:
-        lines.append(f"- Your recent performance in {subject} is still close to your overall pattern in that subject.")
+        lines.append(
+            f"- Your recent trend in {subject} is {recent_score}% against an average of {avg_score}%."
+        )
     elif recent_score is not None:
-        lines.append(f"- Your latest result in {subject} is the best guide for what to revise next.")
+        lines.append(f"- Your latest score in {subject} is {recent_score}%.")
 
-    if any(word in latest for word in ["mistake", "wrong", "error", "concept", "why"]):
-        if valid_concept:
-            lines.append(valid_concept)
-        else:
-            lines.append(f"- There is not enough repeated mistake evidence yet in {subject} to identify a strong concept pattern.")
-    elif any(word in latest for word in ["time", "behavior", "quick", "slow", "rush", "pace"]):
-        if valid_behavior:
-            lines.append(valid_behavior)
-        else:
-            lines.append(f"- There is not enough repeated behavior evidence yet in {subject} to identify a strong pacing pattern.")
+    normalized_message = _normalize_text(latest_message).lower()
+    if any(word in normalized_message for word in ["next", "plan", "improve", "focus"]):
+        lines.append("- Focus on revising one chapter at a time and solving mixed practice questions daily.")
     else:
-        if valid_concept:
-            lines.append(valid_concept)
-        if valid_behavior:
-            lines.append(valid_behavior)
-        if not valid_concept and not valid_behavior:
-            lines.append(f"- There is not enough repeated evidence yet in {subject} to identify a strong pattern.")
+        lines.append("- Ask about a specific chapter or mistake pattern for more targeted help.")
 
-    lines.append(f"- Ask about a specific weak topic in {subject} if you want a more targeted explanation.")
     return "\n".join(lines)
-
-
-def comprehensive_answer_analysis(questions_data):
-    """Deep conceptual analysis for every test attempt using question-level evidence."""
-    if not questions_data or len(questions_data) < 3:
-        return "No deep conceptual pattern detected from current answer script."
-
-    prepared = []
-    for idx, question in enumerate(questions_data, start=1):
-        prepared.append({
-            "index": idx,
-            "topic": _normalize_topic(question.get("topic")),
-            "difficulty": _normalize_difficulty(question.get("difficulty")),
-            "question_text": _normalize_text(question.get("question_text"))[:220],
-            "selected_answer": _normalize_text(question.get("selected_answer")),
-            "correct_answer": _normalize_text(question.get("correct_answer")),
-            "is_correct": bool(question.get("is_correct", False)),
-            "answer_changed": bool(question.get("answer_changed", False)),
-        })
-
-    try:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            return _fallback_comprehensive_analysis(prepared)
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config={"temperature": 0.3},
-        )
-
-        rows = []
-        for row in prepared:
-            rows.append(
-                f"Q{row['index']} | {row['topic']} | {row['difficulty']} | "
-                f"{'correct' if row['is_correct'] else 'incorrect'} | "
-                f"Selected: {row['selected_answer'] or '[blank]'} | "
-                f"Correct: {row['correct_answer'] or '[n/a]'} | "
-                f"Changed: {'yes' if row['answer_changed'] else 'no'} | "
-                f"Question: {row['question_text'] or '[n/a]'}"
-            )
-
-        prompt = f"""You are an advanced Academic Evaluation AI.
-
-Your task is NOT to summarize or give generic feedback.
-Your task is to deeply ANALYZE a student's actual answer script and identify their REAL conceptual understanding.
-
-OBJECTIVE:
-- Understand what the student actually wrote
-- Compare it with expected answers
-- Identify missing concepts
-- Detect misunderstood topics
-- Detect skipped or weak sections
-
-STRICT RULES:
-- DO NOT give generic advice
-- DO NOT mention marks or grades
-- Every conclusion must be evidence-based and reference specific questions
-- If evidence is insufficient, return exactly: No deep conceptual pattern detected from current answer script.
-
-OUTPUT FORMAT:
-## Deep Conceptual Analysis
-- [Topic Weakness] ...with evidence
-- [Missing Concepts] ...specific concept gaps
-- [Answer Quality Issue] ...vague/incomplete reasoning
-
-## Knowledge Coverage Summary
-- Strong Areas:
-- Weak Areas:
-- Skipped/Partially Answered Areas:
-
-## Thinking Pattern Observed
-- Diagnose if memorizing / partial understanding / core misunderstanding
-
-Student question-level evidence:
-{chr(10).join(rows)}
-"""
-
-        response = model.generate_content(prompt)
-        result = _normalize_text(getattr(response, "text", ""))
-        if not result:
-            return _fallback_comprehensive_analysis(prepared)
-        return result.splitlines()
-    except Exception:
-        return _fallback_comprehensive_analysis(prepared)
-
-
-def _fallback_comprehensive_analysis(prepared_rows):
-    if not prepared_rows:
-        return ["No deep conceptual pattern detected from current answer script."]
-
-    by_topic = {}
-    skipped = []
-    for row in prepared_rows:
-        topic = row["topic"]
-        by_topic.setdefault(topic, {"total": 0, "correct": 0, "wrong": []})
-        by_topic[topic]["total"] += 1
-        if row["is_correct"]:
-            by_topic[topic]["correct"] += 1
-        else:
-            by_topic[topic]["wrong"].append(row)
-        if not row["selected_answer"]:
-            skipped.append(f"Q{row['index']} ({topic})")
-
-    strong_areas = []
-    weak_areas = []
-    deep_lines = ["## Deep Conceptual Analysis"]
-
-    for topic, stats in by_topic.items():
-        total = stats["total"]
-        correct = stats["correct"]
-        wrong = stats["wrong"]
-        if total >= 2 and correct == total:
-            strong_areas.append(topic)
-        if wrong:
-            weak_areas.append(topic)
-            evidence = []
-            for row in wrong[:2]:
-                evidence.append(
-                    f"Q{row['index']} selected '{row['selected_answer'] or '[blank]'}' instead of '{row['correct_answer'] or '[n/a]'}'"
-                )
-            deep_lines.append(
-                f"- [Topic Weakness] {topic}: repeated confusion seen in {', '.join(evidence)}."
-            )
-
-    if not weak_areas and not skipped:
-        return ["No deep conceptual pattern detected from current answer script."]
-
-    deep_lines.append("- [Missing Concepts] Incorrect responses indicate concept-level gaps in the weak areas listed below.")
-    if skipped:
-        deep_lines.append(f"- [Answer Quality Issue] Some responses were skipped or blank: {', '.join(skipped[:5])}.")
-
-    summary_lines = [
-        "## Knowledge Coverage Summary",
-        f"- Strong Areas: {', '.join(strong_areas) if strong_areas else 'No clearly strong area from current script.'}",
-        f"- Weak Areas: {', '.join(weak_areas) if weak_areas else 'No repeated weak area detected.'}",
-        f"- Skipped/Partially Answered Areas: {', '.join(skipped[:5]) if skipped else 'No fully skipped answer detected.'}",
-    ]
-
-    if weak_areas and strong_areas:
-        thinking = "- The student shows partial understanding: stable in some topics but repeats concept-level errors in others."
-    elif weak_areas:
-        thinking = "- The student appears to rely on partial recall and misses core conceptual distinctions across multiple questions."
-    else:
-        thinking = "- No deep conceptual pattern detected from current answer script."
-
-    thinking_lines = [
-        "## Thinking Pattern Observed",
-        thinking,
-    ]
-
-    return deep_lines + [""] + summary_lines + [""] + thinking_lines
-
-
-def _concept_match(expected_concept, answer_text):
-    concept = _normalize_text(expected_concept).lower()
-    answer = _normalize_text(answer_text).lower()
-    if not concept:
-        return "missing"
-    if concept in answer:
-        return "covered"
-
-    concept_tokens = [token for token in concept.replace("-", " ").split() if len(token) >= 4]
-    if concept_tokens and any(token in answer for token in concept_tokens):
-        return "partial"
-    return "missing"
-
-
-def _build_deep_analysis_fallback(questions, answer_map):
-    topic_evidence = {}
-    topic_missing = {}
-    strong_topics = set()
-    weak_topics = set()
-    skipped = []
-    quality_issues = []
-
-    for idx, question in enumerate(questions, start=1):
-        question_text = _normalize_text(question.get("question_text"))
-        topic = _normalize_topic(question.get("topic"))
-        expected = question.get("expected_concepts") or []
-        if not isinstance(expected, list):
-            expected = [str(expected)]
-
-        answer = _normalize_text(
-            answer_map.get(str(idx), "")
-            or answer_map.get(question_text, "")
-            or answer_map.get(str(question.get("question_id", "")), "")
-            or question.get("student_answer", "")
-        )
-
-        topic_evidence.setdefault(topic, [])
-        topic_missing.setdefault(topic, {})
-
-        if not answer:
-            skipped.append(f"Q{idx} ({topic}): no answer was written.")
-            topic_evidence[topic].append(f"Q{idx} was skipped.")
-            weak_topics.add(topic)
-            continue
-
-        if len(answer.split()) < 8:
-            quality_issues.append(
-                f"Q{idx} ({topic}) is very short and vague, suggesting incomplete reasoning."
-            )
-
-        covered = 0
-        partial = 0
-        missing = 0
-        missing_concepts = []
-
-        for concept in expected:
-            status = _concept_match(concept, answer)
-            if status == "covered":
-                covered += 1
-            elif status == "partial":
-                partial += 1
-            else:
-                missing += 1
-                missing_concepts.append(str(concept))
-                topic_missing[topic][str(concept)] = topic_missing[topic].get(str(concept), 0) + 1
-
-        topic_evidence[topic].append(
-            f"Q{idx}: covered={covered}, partial={partial}, missing={missing}."
-        )
-
-        if expected and covered >= max(1, int(len(expected) * 0.7)) and missing == 0:
-            strong_topics.add(topic)
-        if missing > 0 or partial > 0:
-            weak_topics.add(topic)
-            if missing_concepts:
-                quality_issues.append(
-                    f"Q{idx} ({topic}) misses concepts: {', '.join(missing_concepts[:4])}."
-                )
-
-    if not weak_topics and not quality_issues and not skipped:
-        return "No deep conceptual pattern detected from current answer script."
-
-    deep_lines = ["## Deep Conceptual Analysis"]
-    for topic in sorted(weak_topics):
-        repeated_missing = [
-            concept for concept, count in topic_missing.get(topic, {}).items() if count >= 2
-        ]
-        repeated_text = (
-            f"Repeated missing concepts: {', '.join(repeated_missing[:4])}."
-            if repeated_missing
-            else "Missing concepts are spread across multiple questions in this topic."
-        )
-        evidence_text = " ".join(topic_evidence.get(topic, [])[:3])
-        deep_lines.append(
-            f"- [{topic} Weakness]: {repeated_text} Evidence: {evidence_text}"
-        )
-
-    if quality_issues:
-        for issue in quality_issues[:5]:
-            deep_lines.append(f"- [Answer Quality Issue]: {issue}")
-
-    coverage_lines = [
-        "## Knowledge Coverage Summary",
-        f"- Strong Areas: {', '.join(sorted(strong_topics)) if strong_topics else 'No clearly strong topic from current script.'}",
-        f"- Weak Areas: {', '.join(sorted(weak_topics)) if weak_topics else 'No repeated weak topic detected.'}",
-        f"- Skipped/Partially Answered Areas: {'; '.join(skipped[:5]) if skipped else 'No fully skipped answer detected.'}",
-    ]
-
-    thinking_lines = ["## Thinking Pattern Observed"]
-    if skipped and weak_topics:
-        thinking_lines.append(
-            "- The script suggests partial understanding with avoidance of concept-heavy parts, not full conceptual command."
-        )
-    elif weak_topics and quality_issues:
-        thinking_lines.append(
-            "- The student appears to know fragments of topics but struggles to connect definitions, reasoning, and complete explanations."
-        )
-    elif weak_topics:
-        thinking_lines.append(
-            "- The student shows partial topic familiarity but recurring conceptual omissions across related questions."
-        )
-    else:
-        thinking_lines.append(
-            "- No deep conceptual pattern detected from current answer script."
-        )
-
-    return "\n".join(deep_lines + [""] + coverage_lines + [""] + thinking_lines)
-
-
-def deep_answer_script_analysis(questions, student_answers):
-    if not isinstance(questions, list) or not questions:
-        return "No deep conceptual pattern detected from current answer script."
-
-    answer_map = {}
-    if isinstance(student_answers, dict):
-        answer_map = {str(k): _normalize_text(v) for k, v in student_answers.items()}
-    elif isinstance(student_answers, list):
-        for idx, item in enumerate(student_answers, start=1):
-            if isinstance(item, str):
-                answer_map[str(idx)] = _normalize_text(item)
-                continue
-            if not isinstance(item, dict):
-                continue
-            answer_text = _normalize_text(item.get("answer_text") or item.get("answer") or item.get("content"))
-            key_candidates = [
-                str(item.get("question_id", "")),
-                _normalize_text(item.get("question_text")),
-                str(idx),
-            ]
-            for key in key_candidates:
-                if key:
-                    answer_map[key] = answer_text
-
-    non_empty_answers = sum(1 for value in answer_map.values() if value)
-    if non_empty_answers < 2:
-        return "No deep conceptual pattern detected from current answer script."
-
-    try:
-        api_key = os.getenv("GOOGLE_API_KEY")
-        if not api_key:
-            return _build_deep_analysis_fallback(questions, answer_map)
-
-        normalized_questions = []
-        for idx, question in enumerate(questions, start=1):
-            if not isinstance(question, dict):
-                continue
-            question_text = _normalize_text(question.get("question_text"))
-            topic = _normalize_topic(question.get("topic"))
-            expected = question.get("expected_concepts") or []
-            if not isinstance(expected, list):
-                expected = [str(expected)]
-            answer = _normalize_text(
-                question.get("student_answer")
-                or answer_map.get(str(question.get("question_id", "")), "")
-                or answer_map.get(question_text, "")
-                or answer_map.get(str(idx), "")
-            )
-            normalized_questions.append({
-                "index": idx,
-                "question_text": question_text,
-                "topic": topic,
-                "expected_concepts": [str(x) for x in expected],
-                "student_answer": answer,
-            })
-
-        if len(normalized_questions) < 2:
-            return "No deep conceptual pattern detected from current answer script."
-
-        payload = ""
-        for row in normalized_questions:
-            payload += (
-                f"\nQ{row['index']}"
-                f"\nQuestion: {row['question_text']}"
-                f"\nTopic: {row['topic']}"
-                f"\nExpected Concepts: {', '.join(row['expected_concepts']) if row['expected_concepts'] else 'None provided'}"
-                f"\nStudent Answer: {row['student_answer'] or '[No answer]'}\n"
-            )
-
-        genai.configure(api_key=api_key)
-        model = genai.GenerativeModel(
-            model_name="gemini-2.5-flash",
-            generation_config={"temperature": 0.35},
-        )
-
-        prompt = f"""You are an advanced Academic Evaluation AI.
-
-Your task is NOT to summarize or give generic feedback.
-Your task is to deeply ANALYZE a student's actual answer script and identify their REAL conceptual understanding.
-
-OBJECTIVE:
-- Understand what the student actually wrote
-- Compare it with expected answers
-- Identify missing concepts
-- Detect misunderstood topics
-- Detect skipped or weak sections
-
-CORE RULES:
-1) Perform concept matching for each question:
-   - Correctly covered
-   - Partially covered
-   - Completely missing
-2) Detect repeated conceptual gaps across all questions.
-3) Detect irrelevant, vague, or avoidance-style answers.
-4) Topic-level weakness mapping must include reason and evidence.
-5) Every conclusion must cite evidence from specific question answers.
-
-STRICT RULES:
-- No generic advice
-- No template feedback
-- No marks or grades
-- No scoring language
-
-OUTPUT FORMAT (exact headings):
-## Deep Conceptual Analysis
-- [Topic Weakness]: explanation with evidence from multiple answers
-- [Missing Concepts]: specific concepts not included
-- [Answer Quality Issue]: vague/incomplete reasoning evidence
-
-## Knowledge Coverage Summary
-- Strong Areas:
-- Weak Areas:
-- Skipped/Partially Answered Areas:
-
-## Thinking Pattern Observed
-- Diagnose how the student thinks (memorization/partial understanding/misunderstanding) with evidence.
-
-If evidence is insufficient, return exactly:
-No deep conceptual pattern detected from current answer script.
-
-Question paper and extracted student answers:
-{payload}
-"""
-
-        response = model.generate_content(prompt)
-        result = _normalize_text(getattr(response, "text", ""))
-        if not result:
-            return _build_deep_analysis_fallback(normalized_questions, answer_map)
-        return result
-    except Exception:
-        return _build_deep_analysis_fallback(questions, answer_map)

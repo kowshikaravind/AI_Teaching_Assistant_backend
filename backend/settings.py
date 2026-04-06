@@ -138,3 +138,12 @@ CORS_ALLOWED_ORIGINS = [
     "http://localhost:5174",
     "http://127.0.0.1:5174",
 ]
+
+# AI safety controls for production deployment.
+APT_AI_LLM_ENABLED = os.getenv('APT_AI_LLM_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'on'}
+APT_AI_BACKGROUND_ANALYSIS_ENABLED = os.getenv('APT_AI_BACKGROUND_ANALYSIS_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'on'}
+APT_AI_LLM_MODEL = os.getenv('APT_AI_LLM_MODEL', 'gemini-2.5-flash')
+APT_AI_LLM_MAX_CALLS_PER_MINUTE = int(os.getenv('APT_AI_LLM_MAX_CALLS_PER_MINUTE', '6'))
+APT_AI_LLM_COOLDOWN_SECONDS = int(os.getenv('APT_AI_LLM_COOLDOWN_SECONDS', '180'))
+APT_AI_LLM_MAX_RETRIES = int(os.getenv('APT_AI_LLM_MAX_RETRIES', '1'))
+APT_AI_LLM_BACKOFF_SECONDS = float(os.getenv('APT_AI_LLM_BACKOFF_SECONDS', '1.0'))

@@ -5,24 +5,19 @@ from rest_framework.decorators import api_view
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
+from django.conf import settings
 from django.core.cache import cache
-from django.db import connection
+from django.db import connection, close_old_connections
 import logging
+import json
+import threading
 
 from .models import Student, TestMark, TestQuestion, Subject, UpcomingTest, Notification, AdminCredential, TeacherCredential, StudentTestResponse, TestResult, TestAttempt
 from .serializers import StudentSerializer, TestMarkSerializer, SubjectSerializer, UpcomingTestSerializer, NotificationSerializer, TestQuestionSerializer
-from tracker.ai_core.logic import (
-    build_student_context,
-    chat_with_student_context,
-    analyze_conceptual_mistakes,
-    analyze_test_behavior,
-    build_ai_tutor_context,
-    fallback_student_chat_response,
-    deep_answer_script_analysis,
-    comprehensive_answer_analysis,
-)
+from .ai_core.logic import analyze_test_submission, build_student_context, chat_with_student_context, fallback_student_chat_response, validate_analysis_report
 
 logger = logging.getLogger(__name__)
+AI_UNAVAILABLE_MESSAGE = "AI analysis is temporarily unavailable."
 
 
 def _normalize_subject(subject):
@@ -306,8 +301,7 @@ class StudentChatView(APIView):
         if not history:
             return Response({"error": "No conversation history provided."}, status=status.HTTP_400_BAD_REQUEST)
 
-        # Build structured marks
-        marks = TestMark.objects.filter(student=student).order_by('date_taken')
+        marks = TestMark.objects.filter(student=student).order_by('date_taken', 'id')
         structured_marks = []
         for mark in marks:
             percentage = round((mark.marks_obtained / mark.total_marks) * 100) if mark.total_marks > 0 else 0
@@ -317,24 +311,34 @@ class StudentChatView(APIView):
                 "date": str(mark.date_taken),
                 "marks_obtained": mark.marks_obtained,
                 "total_marks": mark.total_marks,
-                "percentage": percentage
+                "percentage": percentage,
             })
 
-        # Build AI context with real test data.
         insights_lines = []
         if isinstance(subject_insights, dict):
-            avg = subject_insights.get('avg_score')
-            recent = subject_insights.get('recent_score')
-            concepts = subject_insights.get('conceptual_mistakes') or []
-            behaviors = subject_insights.get('behavior_patterns') or []
-            if avg is not None:
-                insights_lines.append(f"Average Score: {avg}%")
-            if recent is not None:
-                insights_lines.append(f"Recent Score: {recent}%")
-            if concepts:
-                insights_lines.append("Conceptual Mistakes: " + "; ".join([str(x) for x in concepts]))
-            if behaviors:
-                insights_lines.append("Behavior Patterns: " + "; ".join([str(x) for x in behaviors]))
+            for label, key in [
+                ('Average Score', 'avg_score'),
+                ('Recent Score', 'recent_score'),
+                ('Strengths', 'strengths'),
+                ('Weak Topics', 'weak_topics'),
+                ('Critical Weak Areas', 'critical_weak_areas'),
+                ('Conceptual Mistakes', 'conceptual_mistakes'),
+                ('Behavior Patterns', 'behavior_patterns'),
+                ('Mastery Summary', 'mastery_summary'),
+                ('Personalized Feedback', 'personalized_feedback'),
+                ('Improvement Plan', 'improvement_plan'),
+                ('Practice Questions', 'practice_questions'),
+            ]:
+                value = subject_insights.get(key)
+                if isinstance(value, list) and value:
+                    insights_lines.append(f"{label}: {', '.join(str(item) for item in value[:5])}")
+                elif isinstance(value, dict) and value:
+                    insights_lines.append(f"{label}: {value}")
+                elif value not in (None, '', []):
+                    if key in {'avg_score', 'recent_score'}:
+                        insights_lines.append(f"{label}: {value}%")
+                    else:
+                        insights_lines.append(f"{label}: {value}")
 
         system_prompt = build_student_context(
             name=student.name,
@@ -461,7 +465,6 @@ class StudentAITutorView(APIView):
                 attempt = item['attempt']
                 test = item['test']
                 mark = item['mark']
-                question_rows = _question_level_rows(test, student) if test else []
 
                 score = float((attempt.score if attempt else (mark.marks_obtained if mark else 0)) or 0)
                 total_marks = float((attempt.total_marks if attempt else (mark.total_marks if mark else 0)) or 0)
@@ -472,39 +475,20 @@ class StudentAITutorView(APIView):
                 else:
                     pct = 0
 
-                conceptual_patterns = attempt.conceptual_patterns if attempt else []
-                behavior_patterns = attempt.behavior_patterns if attempt else []
-                strengths = []
-
-                # Refresh from the actual submitted rows whenever they exist.
-                if test and question_rows:
-                    conceptual_patterns = analyze_conceptual_mistakes(question_rows)
-                    behavior_patterns = analyze_test_behavior(question_rows)
-                    strengths = _analyze_question_strengths(question_rows)
-                    if _table_exists('tracker_testattempt'):
-                        if attempt:
-                            attempt.conceptual_patterns = conceptual_patterns
-                            attempt.behavior_patterns = behavior_patterns
-                            attempt.save(update_fields=['conceptual_patterns', 'behavior_patterns', 'updated_at'])
-                        elif mark:
-                            attempt, _ = TestAttempt.objects.update_or_create(
-                                student=student,
-                                test=test,
-                                defaults=_legacy_attempt_defaults(
-                                    student,
-                                    test,
-                                    mark,
-                                    question_rows,
-                                    conceptual_patterns,
-                                    behavior_patterns,
-                                ),
-                            )
-                elif test:
-                    strengths = _analyze_question_strengths(question_rows)
-
-                mastery_summary = strengths[0] if strengths else "No strong mastery summary available yet."
-
-                comprehensive_analysis = comprehensive_answer_analysis(question_rows) if question_rows else []
+                question_rows = _question_level_rows(test, student) if test else []
+                analysis = analyze_test_submission(
+                    question_rows,
+                    student_name=student.name,
+                    test_name=test.test_name if test else mark.test_name,
+                    subject_name=(test.subject or test.topic or 'General') if test else mark.subject,
+                    use_llm=False,
+                )
+                result_row = TestResult.objects.filter(student=student, test=test).order_by('-completed_at').first() if test else None
+                conceptual_patterns = attempt.conceptual_patterns if attempt and isinstance(attempt.conceptual_patterns, list) else analysis.get('conceptual_patterns', [])
+                behavior_patterns = attempt.behavior_patterns if attempt and isinstance(attempt.behavior_patterns, list) else analysis.get('behavior_patterns', [])
+                strengths = result_row.strengths if result_row and isinstance(result_row.strengths, list) else analysis.get('strengths', [])
+                mastery_summary = analysis.get('mastery_summary', AI_UNAVAILABLE_MESSAGE)
+                comprehensive_analysis = analysis.get('comprehensive_analysis', ["Use the chat button for AI insights."])
 
                 test_entries.append({
                     'test_id': test.id if test else f"legacy-{mark.id}",
@@ -518,6 +502,15 @@ class StudentAITutorView(APIView):
                     'strengths': _strength_message("No strong strengths detected yet.", strengths),
                     'mastery_summary': mastery_summary,
                     'comprehensive_analysis': comprehensive_analysis if isinstance(comprehensive_analysis, list) else [comprehensive_analysis],
+                    'performance_summary': analysis.get('performance_summary', {}),
+                    'topic_analysis': analysis.get('topic_analysis', {}),
+                    'mistake_breakdown': analysis.get('mistake_breakdown', {}),
+                    'detailed_mistake_analysis': analysis.get('detailed_mistake_analysis', []),
+                    'repeated_weakness': analysis.get('repeated_weakness'),
+                    'personalized_feedback': analysis.get('personalized_feedback', ''),
+                    'improvement_plan': analysis.get('improvement_plan', []),
+                    'practice_questions': analysis.get('practice_questions', []),
+                    'predicted_performance': result_row.predicted_performance if result_row and isinstance(result_row.predicted_performance, dict) else analysis.get('predicted_performance', {}),
                 })
 
             for index, entry in enumerate(test_entries):
@@ -537,6 +530,9 @@ class StudentAITutorView(APIView):
                 'behavior_patterns': latest_test['behavior_patterns'] if latest_test else ["No review available."],
                 'strengths': latest_test['strengths'] if latest_test else ["No review available."],
                 'mastery_summary': latest_test['mastery_summary'] if latest_test else "No review available.",
+                'personalized_feedback': latest_test['personalized_feedback'] if latest_test else "No review available.",
+                'improvement_plan': latest_test['improvement_plan'] if latest_test else [],
+                'practice_questions': latest_test['practice_questions'] if latest_test else [],
                 'tests': list(reversed(test_entries)),
             })
 
@@ -545,37 +541,130 @@ class StudentAITutorView(APIView):
 
 
 class DeepAnswerScriptAnalysisView(APIView):
-        """
-        POST /api/answer-script/deep-analysis/
+    """
+    POST /api/answer-script/deep-analysis/
 
-        Body:
-        {
-            "questions": [
-                {
-                    "question_id": 1,
-                    "question_text": "...",
-                    "topic": "...",
-                    "expected_concepts": ["...", "..."]
-                }
-            ],
-            "student_answers": [
-                {"question_id": 1, "answer_text": "..."}
-            ]
-        }
-        """
+    Body:
+    {
+        "questions": [
+            {
+                "question_id": 1,
+                "question_text": "...",
+                "topic": "...",
+                "expected_concepts": ["...", "..."]
+            }
+        ],
+        "student_answers": [
+            {"question_id": 1, "answer_text": "..."}
+        ]
+    }
+    """
 
-        def post(self, request):
-                questions = request.data.get('questions', [])
-                student_answers = request.data.get('student_answers', {})
+    def post(self, request):
+        questions = request.data.get('questions') or request.data.get('rows') or []
+        student_answers = request.data.get('student_answers', [])
 
-                if not isinstance(questions, list) or not questions:
-                        return Response(
-                                {'error': 'questions must be a non-empty list.'},
-                                status=status.HTTP_400_BAD_REQUEST,
-                        )
+        if not isinstance(questions, list) or not questions:
+            return Response(
+                {'error': 'questions must be a non-empty list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
 
-                analysis = deep_answer_script_analysis(questions, student_answers)
-                return Response({'analysis': analysis}, status=status.HTTP_200_OK)
+        answer_lookup = {}
+        if isinstance(student_answers, dict):
+            answer_lookup = {str(key): value for key, value in student_answers.items()}
+        elif isinstance(student_answers, list):
+            for row in student_answers:
+                if not isinstance(row, dict):
+                    continue
+                qid = row.get('question_id', row.get('id'))
+                if qid is None:
+                    continue
+                answer_lookup[str(qid)] = row
+
+        normalized_rows = []
+        for index, row in enumerate(questions, start=1):
+            if not isinstance(row, dict):
+                continue
+            qid = row.get('question_id', row.get('id', index))
+            answer_row = answer_lookup.get(str(qid), {}) if isinstance(answer_lookup, dict) else {}
+            normalized_rows.append({
+                'question_id': qid,
+                'question_text': row.get('question_text') or row.get('question') or '',
+                'student_answer': row.get('student_answer') or row.get('selected_answer') or row.get('answer') or answer_row.get('student_answer') or answer_row.get('answer') or answer_row.get('answer_text') or '',
+                'correct_answer': row.get('correct_answer') or row.get('expected_answer') or '',
+                'topic': row.get('topic') or row.get('subject') or 'General',
+                'subtopic': row.get('subtopic') or row.get('sub_topic') or row.get('topic_detail') or '',
+                'time_taken_seconds': row.get('time_taken_seconds') or answer_row.get('time_taken_seconds') or answer_row.get('response_time') or 0,
+                'answer_changed': row.get('answer_changed') if 'answer_changed' in row else answer_row.get('answer_changed', False),
+                'difficulty': row.get('difficulty') or answer_row.get('difficulty') or 'Medium',
+                'options': row.get('options') or {},
+            })
+
+        use_llm = bool(request.data.get('use_llm', False))
+        analysis = analyze_test_submission(
+            normalized_rows,
+            student_name=request.data.get('student_name'),
+            test_name=request.data.get('test_name'),
+            subject_name=request.data.get('subject_name'),
+            use_llm=use_llm,
+        )
+        return Response({'analysis': analysis, **analysis}, status=status.HTTP_200_OK)
+
+
+class ValidateAIAnalysisOutputView(APIView):
+    """
+    POST /api/answer-script/validate-analysis/
+
+    Body:
+    {
+        "questions": [
+            {
+                "question_id": 1,
+                "question_text": "...",
+                "topic": "...",
+                "expected_concepts": ["...", "..."]
+            }
+        ],
+        "student_answers": [
+            {"question_id": 1, "answer_text": "..."}
+        ],
+        "ai_output": "<AI generated analysis to validate>"
+    }
+    """
+
+    def post(self, request):
+        questions = request.data.get('questions', [])
+        ai_output = request.data.get('ai_output', '')
+
+        if not isinstance(questions, list) or not questions:
+            return Response(
+                {'error': 'questions must be a non-empty list.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        if isinstance(ai_output, str):
+            ai_output = ai_output.strip()
+            if not ai_output:
+                return Response(
+                    {'error': 'ai_output must be a non-empty string or object.'},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                parsed_output = json.loads(ai_output)
+            except Exception:
+                parsed_output = {'analysis': ai_output}
+        elif isinstance(ai_output, dict):
+            parsed_output = ai_output
+        else:
+            return Response(
+                {'error': 'ai_output must be a non-empty string or object.'},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        report = parsed_output.get('analysis') if isinstance(parsed_output.get('analysis'), dict) else parsed_output
+        validation = validate_analysis_report(report if isinstance(report, dict) else {})
+        return Response({'report': validation}, status=status.HTTP_200_OK)
 
 
 class SubjectListCreateView(generics.ListCreateAPIView):
@@ -1121,6 +1210,7 @@ def _question_level_rows(test, student):
         rows.append({
             'question_id': question_id,
             'question_text': question.get('question_text', ''),
+            'question_type': question.get('question_type', 'MCQ'),
             'selected_answer': selected_answer,
             'correct_answer': str(question.get('correct_answer', '') or '').strip(),
             'topic': question.get('topic', '') or 'General',
@@ -1154,7 +1244,7 @@ def _strength_message(default_message, strengths):
 
 def _analyze_question_strengths(question_rows):
     if not question_rows:
-        return ["No strong mastery evidence available yet."]
+        return []
 
     topic_stats = {}
     total_correct = 0
@@ -1205,9 +1295,6 @@ def _analyze_question_strengths(question_rows):
             strengths.append(
                 f"- {topic} appears well controlled: the answers from this area show consistent concept recall and few misses."
             )
-
-    if not strengths:
-        strengths.append("- The script shows some correct concept handling, but not enough repeated evidence to isolate a strong mastery pattern.")
 
     return strengths
 
@@ -1350,9 +1437,18 @@ def _finalize_test_submission(test, student, runtime=None):
 
     stats = _compute_response_stats(test, student, payload)
     question_rows = _question_level_rows(test, student)
-    conceptual_patterns = analyze_conceptual_mistakes(question_rows) if question_rows else ["No review available."]
-    behavior_patterns = analyze_test_behavior(question_rows) if question_rows else ["No review available."]
-    strengths = _analyze_question_strengths(question_rows) if question_rows else ["No review available."]
+    analysis = analyze_test_submission(
+        _question_level_rows(test, student),
+        student_name=student.name,
+        test_name=test.test_name,
+        subject_name=test.subject or test.topic or 'General',
+        use_llm=False,
+    )
+    conceptual_patterns = analysis.get('conceptual_patterns', [])
+    behavior_patterns = analysis.get('behavior_patterns', [])
+    strengths = analysis.get('strengths', [])
+    weaknesses = analysis.get('weaknesses', [])
+    recommendations = analysis.get('recommendations', [])
 
     question_bank = _coerce_question_bank(test)
     for question in question_bank:
@@ -1424,9 +1520,9 @@ def _finalize_test_submission(test, student, runtime=None):
                 'status': 'Completed',
                 'topic_wise_analysis': stats['topic_wise_analysis'],
                 'strengths': strengths,
-                'weaknesses': [],
-                'recommendations': '',
-                'predicted_performance': {},
+                'weaknesses': weaknesses,
+                'recommendations': '\n'.join(f'- {item}' for item in recommendations),
+                'predicted_performance': analysis.get('predicted_performance', {}),
             },
         )
     except Exception:
@@ -1473,6 +1569,69 @@ def _finalize_test_submission(test, student, runtime=None):
 
     _run_performance_analysis(test_mark)
     return stats
+
+
+def _refresh_ai_analysis_async(test_id, student_id):
+    if not bool(getattr(settings, 'APT_AI_BACKGROUND_ANALYSIS_ENABLED', True)):
+        logger.info('Background AI analysis is disabled by configuration.')
+        return
+
+    inflight_key = f'ai-analysis:inflight:test:{test_id}:student:{student_id}'
+    if not cache.add(inflight_key, '1', timeout=60 * 10):
+        logger.info('Skipping duplicate background AI analysis job for test_id=%s student_id=%s', test_id, student_id)
+        return
+
+    def _worker():
+        close_old_connections()
+        try:
+            student = Student.objects.filter(pk=student_id).first()
+            test = UpcomingTest.objects.filter(pk=test_id).first()
+            if not student or not test:
+                return
+
+            review_rows = _question_level_rows(test, student)
+            if not review_rows:
+                return
+
+            analysis = analyze_test_submission(
+                review_rows,
+                student_name=student.name,
+                test_name=test.test_name,
+                subject_name=test.subject or test.topic or 'General',
+                use_llm=True,
+            )
+
+            conceptual_patterns = analysis.get('conceptual_patterns', [])
+            behavior_patterns = analysis.get('behavior_patterns', [])
+            strengths = analysis.get('strengths', [])
+            weaknesses = analysis.get('weaknesses', [])
+            recommendations = analysis.get('recommendations', [])
+
+            if _table_exists('tracker_testattempt'):
+                TestAttempt.objects.filter(student=student, test=test).update(
+                    conceptual_patterns=conceptual_patterns,
+                    behavior_patterns=behavior_patterns,
+                )
+
+            TestResult.objects.filter(student=student, test=test).update(
+                strengths=strengths,
+                weaknesses=weaknesses,
+                recommendations='\n'.join(f'- {item}' for item in recommendations),
+                predicted_performance=analysis.get('predicted_performance', {}),
+            )
+        except Exception as exc:
+            logger.warning(
+                'ASYNC_AI_ANALYSIS_REFRESH_FAILED student_id=%s test_id=%s error=%s',
+                student_id,
+                test_id,
+                str(exc),
+            )
+        finally:
+            cache.delete(inflight_key)
+            close_old_connections()
+
+    thread = threading.Thread(target=_worker, daemon=True)
+    thread.start()
 
 
 class StudentTestDetailsView(APIView):
@@ -1561,6 +1720,27 @@ class StudentTestReviewView(APIView):
                 'time_taken_seconds': int(attempt.time_taken_seconds or 0),
             })
         percentage = round((stats['score'] / stats['total_marks']) * 100, 2) if stats['total_marks'] else 0
+        analysis = analyze_test_submission(
+            review_rows,
+            student_name=student.name,
+            test_name=test.test_name,
+            subject_name=test.subject or test.topic or 'General',
+            use_llm=False,
+        )
+
+        if attempt and isinstance(attempt.conceptual_patterns, list) and attempt.conceptual_patterns:
+            analysis['conceptual_patterns'] = attempt.conceptual_patterns
+        if attempt and isinstance(attempt.behavior_patterns, list) and attempt.behavior_patterns:
+            analysis['behavior_patterns'] = attempt.behavior_patterns
+
+        result_row = TestResult.objects.filter(student=student, test=test).order_by('-completed_at').first()
+        if result_row:
+            if isinstance(result_row.strengths, list) and result_row.strengths:
+                analysis['strengths'] = result_row.strengths
+            if isinstance(result_row.weaknesses, list) and result_row.weaknesses:
+                analysis['weaknesses'] = result_row.weaknesses
+            if isinstance(result_row.predicted_performance, dict) and result_row.predicted_performance:
+                analysis['predicted_performance'] = result_row.predicted_performance
 
         return Response({
             'test_id': test.id,
@@ -1583,6 +1763,8 @@ class StudentTestReviewView(APIView):
                 }
                 for row in review_rows
             ],
+            **analysis,
+            'analysis': analysis,
         }, status=status.HTTP_200_OK)
 
 
@@ -1681,6 +1863,8 @@ class StudentSubmitTestView(APIView):
         if not stats:
             return Response({'error': 'No responses available to submit.'}, status=status.HTTP_400_BAD_REQUEST)
 
+        _refresh_ai_analysis_async(test.id, student.id)
+
         return Response({
             'score': stats['score'],
             'total_marks': stats['total_marks'],
@@ -1691,6 +1875,7 @@ class StudentSubmitTestView(APIView):
             'unattempted': stats['unattempted_count'],
             'time_taken_seconds': stats['time_taken_seconds'],
             'status': 'Completed',
+            'ai_analysis_status': 'processing',
         }, status=status.HTTP_200_OK)
 
 
@@ -2197,8 +2382,7 @@ def TeacherClassChatView(request):
     if isinstance(reply, str) and reply.startswith('Error:'):
         if not marks:
             reply = (
-                f"I can only see enrollment data for class {assigned_class} right now. "
-                "There are no marks yet, so I cannot rank interventions."
+                f"Class {assigned_class} has no marks yet, so I can only help with planning and next steps."
             )
         else:
             weakest_subject = min(
@@ -2206,9 +2390,7 @@ def TeacherClassChatView(request):
                 key=lambda item: (sum(item[1]) / len(item[1])) if item[1] else 0,
             )[0] if subject_bucket else 'General'
             reply = (
-                f"Based on available records for {assigned_class}, class average is {class_avg}%. "
-                f"Weakest subject trend appears in {weakest_subject}. "
-                "Prioritize students in the bottom-3 list and run targeted remediation on that subject first."
+                f"Current class average is {class_avg}%. The lowest-performing subject trend is {weakest_subject}. "
+                "Prioritize revision for bottom-performing students first."
             )
-
     return Response({'reply': reply}, status=status.HTTP_200_OK)
