@@ -16,7 +16,7 @@ import re
 import csv
 import io
 
-from .models import Student, TestMark, TestQuestion, Subject, UpcomingTest, Notification, AdminCredential, TeacherCredential, StudentTestResponse, TestResult, TestAttempt
+from .models import Student, TestMark, TestQuestion, Subject, UpcomingTest, Notification, AdminCredential, TeacherCredential, StudentTestResponse, TestResult, TestAttempt, AIAnalysisResult
 from .serializers import StudentSerializer, TestMarkSerializer, SubjectSerializer, UpcomingTestSerializer, NotificationSerializer, TestQuestionSerializer
 from .ai_core.logic import analyze_test_submission, build_student_context, chat_with_student_context, fallback_student_chat_response, validate_analysis_report
 
@@ -113,7 +113,6 @@ def _run_performance_analysis(new_mark):
         subject=subject_label,
     ).exists()
 
-    # Teacher escalation: warning existed earlier and still no improvement in next subject test.
     if prior_warning_exists and previous_score is not None and latest_score <= previous_score:
         _create_notification(
             student=student,
@@ -151,11 +150,29 @@ def _run_performance_analysis(new_mark):
 
 
 def _student_has_submitted_test(student, test):
-    if _table_exists('tracker_testattempt') and TestAttempt.objects.filter(student=student, test=test).exists():
-        return True
+    has_attempt_table = _table_exists('tracker_testattempt')
+    has_result_table = _table_exists('tracker_testresult')
 
-    if _table_exists('tracker_testresult') and TestResult.objects.filter(student=student, test=test).exclude(status='InProgress').exists():
-        return True
+    if has_attempt_table:
+        attempt = TestAttempt.objects.filter(student=student, test=test).order_by('-updated_at').first()
+        if attempt:
+            if int(attempt.attempted_count or 0) > 0:
+                return True
+            if _has_meaningful_attempt_payload(attempt.answers_payload):
+                return True
+
+    if has_result_table and TestResult.objects.filter(student=student, test=test).exclude(status='InProgress').exists():
+        if has_attempt_table:
+            attempt = TestAttempt.objects.filter(student=student, test=test).order_by('-updated_at').first()
+            if attempt and (int(attempt.attempted_count or 0) > 0 or _has_meaningful_attempt_payload(attempt.answers_payload)):
+                return True
+        else:
+            return True
+
+    # Legacy fallback: use TestMark matching only on old schemas where
+    # attempt/result tables do not exist.
+    if has_attempt_table or has_result_table:
+        return False
 
     normalized_subject = _normalize_subject(test.subject or test.topic or 'General')
     test_name_key = ' '.join(str(test.test_name or '').strip().lower().split())
@@ -169,17 +186,6 @@ def _student_has_submitted_test(student, test):
         _normalize_subject(mark.subject) == normalized_subject
         and ' '.join(str(mark.test_name or '').strip().lower().split()) == test_name_key
         for mark in marks
-    )
-
-    logger.warning(
-        'TEST_SUBMISSION_MATCH_DEBUG student_id=%s test_id=%s subject=%s name=%s date=%s candidates=%s matched=%s',
-        student.id,
-        test.id,
-        normalized_subject,
-        test_name_key,
-        str(test.test_date),
-        marks.count(),
-        matched,
     )
 
     return matched
@@ -389,8 +395,11 @@ class StudentAITutorView(APIView):
     """
     def get(self, request, pk):
         student = get_object_or_404(Student, pk=pk)
-        
-        # Check if TestAttempt table exists before querying
+
+        attempts = []
+        attempt_by_test_id = {}
+        result_by_test_id = {}
+
         try:
             if _table_exists('tracker_testattempt'):
                 attempts = list(
@@ -399,40 +408,30 @@ class StudentAITutorView(APIView):
                     .select_related('test')
                     .order_by('test__subject', 'test__test_date', 'test__id')
                 )
-            else:
-                attempts = []
+                attempt_by_test_id = {a.test_id: a for a in attempts}
         except Exception:
             attempts = []
-        
+            attempt_by_test_id = {}
+
+        try:
+            if _table_exists('tracker_testresult'):
+                results = list(
+                    TestResult.objects
+                    .filter(student=student)
+                    .exclude(status='InProgress')
+                    .order_by('test__test_date', 'test__id')
+                )
+                result_by_test_id = {r.test_id: r for r in results}
+        except Exception:
+            result_by_test_id = {}
+
         marks = list(TestMark.objects.filter(student=student).order_by('date_taken', 'id'))
-
         grouped = {}
-        attempt_keys = set()
+        used_test_ids = set()
 
-        for attempt in attempts:
-            subject = _subject_label(attempt.test.subject or attempt.test.topic or 'General')
-            key = (
-                _normalize_subject(subject),
-                ' '.join(str(attempt.test.test_name or '').strip().lower().split()),
-                str(attempt.test.test_date),
-            )
-            attempt_keys.add(key)
-            grouped.setdefault(subject, []).append({
-                'attempt': attempt,
-                'test': attempt.test,
-                'mark': None,
-            })
-
+        # Start from past test marks so score-only rows are preserved.
         for mark in marks:
             subject = _subject_label(mark.subject or 'General')
-            key = (
-                _normalize_subject(subject),
-                ' '.join(str(mark.test_name or '').strip().lower().split()),
-                str(mark.date_taken),
-            )
-            if key in attempt_keys:
-                continue
-
             test = (
                 UpcomingTest.objects
                 .filter(test_name=mark.test_name, test_date=mark.date_taken)
@@ -448,10 +447,43 @@ class StudentAITutorView(APIView):
                     .first()
                 )
 
+            if not test:
+                continue
+
+            used_test_ids.add(test.id)
             grouped.setdefault(subject, []).append({
-                'attempt': None,
+                'attempt': attempt_by_test_id.get(test.id),
+                'result': result_by_test_id.get(test.id),
                 'test': test,
                 'mark': mark,
+            })
+
+        for test_id, attempt in attempt_by_test_id.items():
+            if test_id in used_test_ids:
+                continue
+            test = attempt.test
+            if not test:
+                continue
+            subject = _subject_label(test.subject or test.topic or 'General')
+            grouped.setdefault(subject, []).append({
+                'attempt': attempt,
+                'result': result_by_test_id.get(test_id),
+                'test': test,
+                'mark': None,
+            })
+
+        for test_id, result_row in result_by_test_id.items():
+            if test_id in used_test_ids:
+                continue
+            test = result_row.test
+            if not test:
+                continue
+            subject = _subject_label(test.subject or test.topic or 'General')
+            grouped.setdefault(subject, []).append({
+                'attempt': attempt_by_test_id.get(test_id),
+                'result': result_row,
+                'test': test,
+                'mark': None,
             })
 
         subjects_data = []
@@ -467,11 +499,18 @@ class StudentAITutorView(APIView):
 
             for item in subject_attempts:
                 attempt = item['attempt']
+                result_row = item.get('result')
                 test = item['test']
                 mark = item['mark']
 
-                score = float((attempt.score if attempt else (mark.marks_obtained if mark else 0)) or 0)
-                total_marks = float((attempt.total_marks if attempt else (mark.total_marks if mark else 0)) or 0)
+                score = float(
+                    (attempt.score if attempt else (result_row.total_score if result_row else (mark.marks_obtained if mark else 0)))
+                    or 0
+                )
+                total_marks = float(
+                    (attempt.total_marks if attempt else (result_row.total_marks if result_row else (mark.total_marks if mark else 0)))
+                    or 0
+                )
 
                 if total_marks:
                     pct = round((score / total_marks) * 100)
@@ -483,21 +522,25 @@ class StudentAITutorView(APIView):
                 analysis = analyze_test_submission(
                     question_rows,
                     student_name=student.name,
-                    test_name=test.test_name if test else mark.test_name,
-                    subject_name=(test.subject or test.topic or 'General') if test else mark.subject,
+                    test_name=test.test_name,
+                    subject_name=(test.subject or test.topic or 'General'),
                     use_llm=False,
                 )
-                result_row = TestResult.objects.filter(student=student, test=test).order_by('-completed_at').first() if test else None
-                conceptual_patterns = attempt.conceptual_patterns if attempt and isinstance(attempt.conceptual_patterns, list) else analysis.get('conceptual_patterns', [])
-                behavior_patterns = attempt.behavior_patterns if attempt and isinstance(attempt.behavior_patterns, list) else analysis.get('behavior_patterns', [])
+                ai_snapshot = _get_ai_analysis_snapshot(student, test, attempt=attempt) if test else {
+                    'conceptual_patterns': [],
+                    'behavior_patterns': [],
+                    'analysis_result': {},
+                }
+                conceptual_patterns = ai_snapshot['conceptual_patterns'] or analysis.get('conceptual_patterns', [])
+                behavior_patterns = ai_snapshot['behavior_patterns'] or analysis.get('behavior_patterns', [])
                 strengths = result_row.strengths if result_row and isinstance(result_row.strengths, list) else analysis.get('strengths', [])
                 mastery_summary = analysis.get('mastery_summary', AI_UNAVAILABLE_MESSAGE)
                 comprehensive_analysis = analysis.get('comprehensive_analysis', ["Use the chat button for AI insights."])
 
                 test_entries.append({
-                    'test_id': test.id if test else f"legacy-{mark.id}",
-                    'test_name': test.test_name if test else mark.test_name,
-                    'test_date': test.test_date if test else mark.date_taken,
+                    'test_id': test.id,
+                    'test_name': test.test_name,
+                    'test_date': test.test_date,
                     'score': score,
                     'total_marks': total_marks,
                     'percentage': pct,
@@ -697,7 +740,22 @@ class UpcomingTestListCreateView(generics.ListCreateAPIView):
         if student_id:
             try:
                 student = Student.objects.get(pk=student_id)
-                queryset = queryset.filter(class_name=student.class_name, questions_generated=True)
+                class_name = str(student.class_name or '').strip()
+                queryset = queryset.filter(questions_generated=True)
+                if class_name:
+                    class_filtered = queryset.filter(class_name__iexact=class_name)
+                    if class_filtered.exists():
+                        queryset = class_filtered
+                    else:
+                        # Fallback for legacy rows with accidental leading/trailing spaces.
+                        matched_ids = [
+                            test.id
+                            for test in queryset
+                            if str(test.class_name or '').strip().lower() == class_name.lower()
+                        ]
+                        queryset = queryset.filter(id__in=matched_ids)
+                else:
+                    queryset = queryset.none()
             except Student.DoesNotExist:
                 return UpcomingTest.objects.none()
         elif assigned_class and assigned_class != 'Class N/A':
@@ -757,25 +815,32 @@ class UpcomingTestListCreateView(generics.ListCreateAPIView):
                 for test in UpcomingTest.objects.filter(id__in=test_ids)
             }
 
-            # Auto-finalize only ended tests that have not been submitted yet.
+            # Auto-finalize only expired tests where student has actual attempted answers.
             for test in test_map.values():
-                if test.end_time and test.end_time < now:
-                    _finalize_test_submission(test, student)
+                _auto_finalize_if_expired_and_attempted(test, student, now)
 
             # Prefer exact linkage via TestAttempt/TestResult to avoid false matches
             # when different tests share the same test_name/date.
             if _table_exists('tracker_testattempt'):
                 submitted_ids.update(
-                    TestAttempt.objects.filter(student=student, test_id__in=test_ids)
+                    TestAttempt.objects.filter(student=student, test_id__in=test_ids, attempted_count__gt=0)
                     .values_list('test_id', flat=True)
                 )
 
             if _table_exists('tracker_testresult'):
-                submitted_ids.update(
+                result_ids = set(
                     TestResult.objects.filter(student=student, test_id__in=test_ids)
                     .exclude(status='InProgress')
                     .values_list('test_id', flat=True)
                 )
+                if _table_exists('tracker_testattempt'):
+                    valid_attempt_ids = set(
+                        TestAttempt.objects.filter(student=student, test_id__in=result_ids, attempted_count__gt=0)
+                        .values_list('test_id', flat=True)
+                    )
+                    submitted_ids.update(valid_attempt_ids)
+                else:
+                    submitted_ids.update(result_ids)
 
             # Legacy fallback only when no test-linked submission tables are available.
             if not _table_exists('tracker_testattempt') and not _table_exists('tracker_testresult'):
@@ -1347,24 +1412,95 @@ def _runtime_cache_key(student_id, test_id):
 def _table_columns(table_name):
     """Get column names for a table (database-agnostic)."""
     try:
-        from django.db import connection
-        inspector = connection.introspection
-        cursor = connection.cursor()
-        
-        # Check if table exists
-        tables = [t[0] for t in inspector.get_table_list(cursor)]
-        if table_name not in tables:
-            return set()
-        
-        # Get field information
-        field_info = inspector.get_columns(cursor, table_name)
-        return {field[0] for field in field_info}
+        with connection.cursor() as cursor:
+            inspector = connection.introspection
+            tables = set(inspector.table_names())
+            if table_name not in tables:
+                return set()
+            description = inspector.get_table_description(cursor, table_name)
+            return {col.name for col in description if getattr(col, 'name', None)}
     except Exception:
         return set()
 
 
 def _table_exists(table_name):
     return bool(_table_columns(table_name))
+
+
+def _has_meaningful_attempt_payload(payload):
+    if not isinstance(payload, dict) or not payload:
+        return False
+
+    for entry in payload.values():
+        if not isinstance(entry, dict):
+            continue
+        answer = str(entry.get('answer', '') or '').strip()
+        if answer:
+            return True
+    return False
+
+
+def _auto_finalize_if_expired_and_attempted(test, student, now=None):
+    """
+    Auto-submit only when test is expired AND student has attempted at least one answer.
+    This prevents creating false unattempted submissions.
+    """
+    if not test or not student:
+        return None
+
+    now = now or timezone.now()
+    if not test.end_time or test.end_time >= now:
+        return None
+
+    if _student_has_submitted_test(student, test):
+        return None
+
+    runtime = cache.get(_runtime_cache_key(student.id, test.id), {})
+    if _has_meaningful_attempt_payload(runtime):
+        return _finalize_test_submission(test, student, runtime)
+
+    persisted = _persisted_answers_map(student, test)
+    if _has_meaningful_attempt_payload(persisted):
+        return _finalize_test_submission(test, student, persisted)
+
+    return None
+
+
+def _get_ai_analysis_snapshot(student, test, attempt=None):
+    """
+    Read AI analysis only from the dedicated AI table.
+    """
+    conceptual_patterns = []
+    behavior_patterns = []
+    analysis_result = {}
+
+    if test and _table_exists('tracker_aianalysisresult'):
+        record = AIAnalysisResult.objects.filter(student=student, test=test).order_by('-updated_at').first()
+        if record:
+            conceptual_patterns = record.conceptual_patterns if isinstance(record.conceptual_patterns, list) else []
+            behavior_patterns = record.behavior_patterns if isinstance(record.behavior_patterns, list) else []
+            analysis_result = record.analysis_result if isinstance(record.analysis_result, dict) else {}
+
+    return {
+        'conceptual_patterns': conceptual_patterns,
+        'behavior_patterns': behavior_patterns,
+        'analysis_result': analysis_result,
+    }
+
+
+def _upsert_ai_analysis_result(student, test, conceptual_patterns, behavior_patterns, analysis):
+    if not test or not _table_exists('tracker_aianalysisresult'):
+        return
+
+    AIAnalysisResult.objects.update_or_create(
+        student=student,
+        test=test,
+        defaults={
+            'conceptual_patterns': conceptual_patterns if isinstance(conceptual_patterns, list) else [],
+            'behavior_patterns': behavior_patterns if isinstance(behavior_patterns, list) else [],
+            'analysis_result': analysis if isinstance(analysis, dict) else {},
+        },
+    )
 
 
 def _persisted_answers_map(student, test):
@@ -1755,8 +1891,9 @@ def _finalize_test_submission(test, student, runtime=None):
             test=test,
             defaults={
                 'answers_payload': question_rows,
-                'conceptual_patterns': conceptual_patterns,
-                'behavior_patterns': behavior_patterns,
+                # Keep legacy fields empty; AI analysis is stored in AIAnalysisResult.
+                'conceptual_patterns': [],
+                'behavior_patterns': [],
                 'score': stats['score'],
                 'total_marks': stats['total_marks'],
                 'correct_count': stats['correct_count'],
@@ -1768,6 +1905,14 @@ def _finalize_test_submission(test, student, runtime=None):
                 'time_taken_seconds': stats['time_taken_seconds'],
             },
         )
+
+    _upsert_ai_analysis_result(
+        student=student,
+        test=test,
+        conceptual_patterns=conceptual_patterns,
+        behavior_patterns=behavior_patterns,
+        analysis=analysis,
+    )
 
     try:
         TestResult.objects.update_or_create(
@@ -1867,10 +2012,18 @@ def _refresh_ai_analysis_async(test_id, student_id):
             weaknesses = analysis.get('weaknesses', [])
             recommendations = analysis.get('recommendations', [])
 
+            _upsert_ai_analysis_result(
+                student=student,
+                test=test,
+                conceptual_patterns=conceptual_patterns,
+                behavior_patterns=behavior_patterns,
+                analysis=analysis,
+            )
+
             if _table_exists('tracker_testattempt'):
                 TestAttempt.objects.filter(student=student, test=test).update(
-                    conceptual_patterns=conceptual_patterns,
-                    behavior_patterns=behavior_patterns,
+                    conceptual_patterns=[],
+                    behavior_patterns=[],
                 )
 
             TestResult.objects.filter(student=student, test=test).update(
@@ -1905,8 +2058,7 @@ class StudentTestDetailsView(APIView):
 
         student_id = request.query_params.get('student_id')
         student = Student.objects.filter(pk=student_id).first() if student_id else None
-        if student and test.end_time and test.end_time < now:
-            _finalize_test_submission(test, student)
+        _auto_finalize_if_expired_and_attempted(test, student, now)
 
         start_time = test.start_time
         end_time = test.end_time
@@ -1988,10 +2140,11 @@ class StudentTestReviewView(APIView):
             use_llm=False,
         )
 
-        if attempt and isinstance(attempt.conceptual_patterns, list) and attempt.conceptual_patterns:
-            analysis['conceptual_patterns'] = attempt.conceptual_patterns
-        if attempt and isinstance(attempt.behavior_patterns, list) and attempt.behavior_patterns:
-            analysis['behavior_patterns'] = attempt.behavior_patterns
+        ai_snapshot = _get_ai_analysis_snapshot(student, test, attempt=attempt)
+        if ai_snapshot['conceptual_patterns']:
+            analysis['conceptual_patterns'] = ai_snapshot['conceptual_patterns']
+        if ai_snapshot['behavior_patterns']:
+            analysis['behavior_patterns'] = ai_snapshot['behavior_patterns']
 
         result_row = TestResult.objects.filter(student=student, test=test).order_by('-completed_at').first()
         if result_row:
@@ -2147,8 +2300,7 @@ class StudentTestResultView(APIView):
 
         test = get_object_or_404(UpcomingTest, pk=pk)
         student = get_object_or_404(Student, pk=student_id)
-        if test.end_time and test.end_time < timezone.now():
-            _finalize_test_submission(test, student)
+        _auto_finalize_if_expired_and_attempted(test, student)
         key = _runtime_cache_key(student.id, test.id)
         runtime = cache.get(key, {})
         attempt = _attempt_summary(student, test)

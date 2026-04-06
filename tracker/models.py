@@ -165,6 +165,33 @@ class TestAttempt(models.Model):
         unique_together = ('student', 'test')
 
 
+class AIAnalysisResult(models.Model):
+    """
+    Stores AI-generated analysis for student test attempts.
+    Completely separate from test attempt data to avoid mixing concerns.
+    """
+    student = models.ForeignKey(Student, on_delete=models.CASCADE, related_name='ai_analysis')
+    test = models.ForeignKey(UpcomingTest, on_delete=models.CASCADE, related_name='ai_analysis')
+    
+    # AI-generated patterns and insights
+    conceptual_patterns = models.JSONField(blank=True, default=list)
+    behavior_patterns = models.JSONField(blank=True, default=list)
+    
+    # Full analysis results
+    analysis_result = models.JSONField(blank=True, default=dict)
+    
+    # Metadata
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+    
+    class Meta:
+        ordering = ['-updated_at']
+        unique_together = ('student', 'test')
+    
+    def __str__(self):
+        return f"AI Analysis: {self.student.name} - {self.test.test_name}"
+
+
 class Notification(models.Model):
     TYPE_CHOICES = [
         ('test', 'Test Notification'),
