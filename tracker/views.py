@@ -2,6 +2,7 @@ from rest_framework import generics, status
 from rest_framework.views import APIView
 from rest_framework.response import Response
 from rest_framework.decorators import api_view
+from rest_framework.parsers import MultiPartParser, FormParser
 from django.shortcuts import get_object_or_404
 from django.contrib.auth.hashers import check_password, make_password
 from django.utils import timezone
@@ -11,6 +12,9 @@ from django.db import connection, close_old_connections
 import logging
 import json
 import threading
+import re
+import csv
+import io
 
 from .models import Student, TestMark, TestQuestion, Subject, UpcomingTest, Notification, AdminCredential, TeacherCredential, StudentTestResponse, TestResult, TestAttempt
 from .serializers import StudentSerializer, TestMarkSerializer, SubjectSerializer, UpcomingTestSerializer, NotificationSerializer, TestQuestionSerializer
@@ -742,6 +746,8 @@ class UpcomingTestListCreateView(generics.ListCreateAPIView):
 
         payload = response.data if isinstance(response.data, list) else []
         student = Student.objects.filter(pk=sid).first()
+
+
         submitted_ids = set()
         now = timezone.now()
         if student:
@@ -981,12 +987,6 @@ class PublishTeacherQuestionsView(APIView):
             test.status = 'active'
             test.save(update_fields=['status'])
 
-        if test.status != 'scheduled':
-            return Response(
-                {'error': 'Questions cannot be modified once test becomes active.'},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
         if test.questions_generated:
             return Response({'error': 'Test is already published. Questions are locked.'}, status=status.HTTP_400_BAD_REQUEST)
 
@@ -1055,6 +1055,266 @@ class PublishTeacherQuestionsView(APIView):
                 'num_questions': test.num_questions,
                 'total_marks': test.total_marks,
                 'workflow_status': 'Published',
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class ParsePastedTeacherQuestionsView(APIView):
+    """
+    POST /api/upcoming-tests/<id>/parse-pasted-questions/
+
+    Body:
+    {
+      "teacher_id": 4,
+      "text": "1) Question...?\nA) ...\nB) ...\nC) ...\nD) ...\nAnswer: B"
+    }
+    """
+
+    _q_start = re.compile(r'^\s*(?:q(?:uestion)?\s*\d+|\d+)[\).:\-\s]+(.+)$', re.IGNORECASE)
+    _opt_line = re.compile(r'^\s*([A-D])[\).:\-\s]+(.+)$', re.IGNORECASE)
+    _answer_line = re.compile(r'^\s*(?:answer|ans)\s*[:\-]?\s*([A-D])\s*$', re.IGNORECASE)
+
+    def post(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+
+        teacher_id = request.data.get('teacher_id')
+        if test.teacher_id and teacher_id and str(test.teacher_id) != str(teacher_id):
+            return Response({'error': 'You are not authorized to parse questions for this test.'}, status=status.HTTP_403_FORBIDDEN)
+
+        raw_text = str(request.data.get('text', '') or '').strip()
+        default_topic = str(request.data.get('topic', test.subject or test.topic or 'General')).strip() or (test.subject or test.topic or 'General')
+        default_difficulty = str(request.data.get('difficulty', 'medium')).strip().lower() or 'medium'
+
+        if not raw_text:
+            return Response({'error': 'text is required.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if default_difficulty not in ('easy', 'medium', 'hard'):
+            return Response({'error': 'difficulty must be easy, medium, or hard.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        lines = [line.rstrip() for line in raw_text.splitlines()]
+        blocks = []
+        current = []
+
+        for line in lines:
+            if not line.strip():
+                if current:
+                    blocks.append(current)
+                    current = []
+                continue
+            current.append(line)
+        if current:
+            blocks.append(current)
+
+        parsed = []
+        rejected = []
+
+        for index, block in enumerate(blocks, start=1):
+            question_text = ''
+            options = {}
+            detected_answer = ''
+
+            for line in block:
+                line_text = line.strip()
+                ans_match = self._answer_line.match(line_text)
+                if ans_match:
+                    detected_answer = ans_match.group(1).upper()
+                    continue
+
+                opt_match = self._opt_line.match(line_text)
+                if opt_match:
+                    key = opt_match.group(1).upper()
+                    value = opt_match.group(2).strip()
+                    if value:
+                        options[key] = value
+                    continue
+
+                q_match = self._q_start.match(line_text)
+                if q_match and not question_text:
+                    question_text = q_match.group(1).strip()
+                    continue
+
+                if not question_text:
+                    question_text = line_text
+                else:
+                    question_text = f"{question_text} {line_text}".strip()
+
+            if len(options) < 2 or not question_text:
+                rejected.append({
+                    'block': index,
+                    'reason': 'Could not detect a valid MCQ question with at least 2 options.',
+                    'raw': '\n'.join(block),
+                })
+                continue
+
+            option_keys = sorted(options.keys())
+            if detected_answer and detected_answer not in options:
+                rejected.append({
+                    'block': index,
+                    'reason': f'Detected answer {detected_answer} is not present in options {option_keys}.',
+                    'raw': '\n'.join(block),
+                })
+                continue
+
+            correct_answer = detected_answer or option_keys[0]
+
+            parsed.append({
+                'question_text': question_text,
+                'question_type': 'MCQ',
+                'options': options,
+                'correct_answer': correct_answer,
+                'marks': 1,
+                'topic': default_topic,
+                'difficulty': default_difficulty,
+            })
+
+        return Response(
+            {
+                'parsed_count': len(parsed),
+                'rejected_count': len(rejected),
+                'questions': parsed,
+                'rejected_blocks': rejected,
+                'next_step': 'Send returned questions to /draft-questions/ or /publish-questions/.' if parsed else 'Fix rejected blocks and try again.',
+            },
+            status=status.HTTP_200_OK,
+        )
+
+
+class UploadTeacherQuestionsCSVView(APIView):
+    """
+    POST /api/upcoming-tests/<id>/upload-questions-csv/
+
+    Form-data:
+    - teacher_id: optional (required when test has bound teacher)
+    - file: csv file
+    - publish: optional boolean, default false
+
+    Supported CSV headers (case-insensitive):
+    - question_text
+    - option_a
+    - option_b
+    - option_c
+    - option_d
+    - correct_answer
+    """
+
+    parser_classes = [MultiPartParser, FormParser]
+
+    def post(self, request, pk):
+        test = get_object_or_404(UpcomingTest, pk=pk)
+
+        teacher_id = request.data.get('teacher_id')
+        if test.teacher_id and teacher_id and str(test.teacher_id) != str(teacher_id):
+            return Response({'error': 'You are not authorized to upload questions for this test.'}, status=status.HTTP_403_FORBIDDEN)
+
+        upload = request.FILES.get('file')
+        if not upload:
+            return Response({'error': 'CSV file is required under field name "file".'}, status=status.HTTP_400_BAD_REQUEST)
+
+        fallback_topic = str(test.subject or test.topic or 'General').strip() or 'General'
+        fallback_difficulty = 'medium'
+
+        publish_flag = str(request.data.get('publish', 'false')).strip().lower() in {'1', 'true', 'yes', 'on'}
+
+        try:
+            raw_bytes = upload.read()
+            try:
+                decoded = raw_bytes.decode('utf-8-sig')
+            except UnicodeDecodeError:
+                decoded = raw_bytes.decode('latin-1')
+        except Exception:
+            return Response({'error': 'Unable to read uploaded CSV file.'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if not str(decoded or '').strip():
+            return Response({'error': 'File is empty'}, status=status.HTTP_400_BAD_REQUEST)
+
+        reader = csv.DictReader(io.StringIO(decoded))
+        headers = [str(h).strip().lower() for h in (reader.fieldnames or []) if str(h).strip()]
+        required_headers = ['question_text', 'option_a', 'option_b', 'option_c', 'option_d', 'correct_answer']
+        if not headers:
+            return Response({'error': 'Invalid CSV format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        if sorted(headers) != sorted(required_headers):
+            return Response({'error': 'Invalid CSV format'}, status=status.HTTP_400_BAD_REQUEST)
+
+        cleaned = []
+        rejected = []
+        seen_questions = set()
+
+        for idx, row in enumerate(reader, start=2):
+            question_text = str(row.get('question_text', '') or '').strip()
+            opt_a = str(row.get('option_a', '') or '').strip()
+            opt_b = str(row.get('option_b', '') or '').strip()
+            opt_c = str(row.get('option_c', '') or '').strip()
+            opt_d = str(row.get('option_d', '') or '').strip()
+            correct = str(row.get('correct_answer', '') or '').strip().upper()
+            topic = fallback_topic
+            difficulty = fallback_difficulty
+
+            options = {}
+            if opt_a:
+                options['A'] = opt_a
+            if opt_b:
+                options['B'] = opt_b
+            if opt_c:
+                options['C'] = opt_c
+            if opt_d:
+                options['D'] = opt_d
+
+            if not question_text:
+                rejected.append({'row': idx, 'reason': 'Question text is empty'})
+                continue
+            if len(options) < 2:
+                rejected.append({'row': idx, 'reason': f'At least 2 options required at row {idx}'})
+                continue
+            if correct not in options:
+                rejected.append({'row': idx, 'reason': f'Correct answer mismatch at row {idx}'})
+                continue
+
+            normalized_question = ' '.join(question_text.lower().split())
+            normalized_options = tuple((key, ' '.join(value.lower().split())) for key, value in sorted(options.items()))
+            duplicate_key = (normalized_question, normalized_options, correct)
+            if duplicate_key in seen_questions:
+                rejected.append({'row': idx, 'reason': f'Duplicate question skipped at row {idx}'})
+                continue
+            seen_questions.add(duplicate_key)
+
+            cleaned.append({
+                'question_text': question_text,
+                'question_type': 'MCQ',
+                'options': options,
+                'correct_answer': correct,
+                'marks': 1,
+                'topic': topic,
+                'difficulty': difficulty,
+            })
+
+        if not cleaned:
+            return Response(
+                {
+                    'error': 'No valid questions found in CSV.',
+                    'parsed_count': 0,
+                    'rejected_count': len(rejected),
+                    'rejected_rows': rejected,
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        test.question_bank = cleaned
+        test.num_questions = len(cleaned)
+        test.total_marks = len(cleaned)
+        test.questions_generated = bool(publish_flag)
+        test.save(update_fields=['question_bank', 'num_questions', 'total_marks', 'questions_generated'])
+
+        return Response(
+            {
+                'message': 'CSV questions imported successfully.',
+                'saved': len(cleaned),
+                'rejected_count': len(rejected),
+                'rejected_rows': rejected,
+                'num_questions': test.num_questions,
+                'total_marks': test.total_marks,
+                'workflow_status': 'Published' if test.questions_generated else 'Draft',
             },
             status=status.HTTP_200_OK,
         )
