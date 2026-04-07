@@ -2582,40 +2582,46 @@ def AdminChangeCredentialsView(request):
 
 @api_view(['POST'])
 def TeacherRegisterView(request):
-    teacher_name = request.data.get('teacher_name', '').strip()
-    username = request.data.get('username', '').strip().lower()
-    password = request.data.get('password', '').strip()
-    assigned_class = request.data.get('assigned_class', '').strip()
+    try:
+        teacher_name = request.data.get('teacher_name', '').strip()
+        username = request.data.get('username', '').strip().lower()
+        password = request.data.get('password', '').strip()
+        assigned_class = request.data.get('assigned_class', '').strip()
 
-    if not teacher_name or not username or not password:
-        return Response({'error': 'Teacher name, username/email, and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
+        if not teacher_name or not username or not password:
+            return Response({'error': 'Teacher name, username/email, and password are required.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if len(password) < 6:
-        return Response({'error': 'Password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
+        if len(password) < 6:
+            return Response({'error': 'Password must be at least 6 characters.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    existing = TeacherCredential.objects.filter(username=username).first()
-    if existing and existing.status == 'approved':
-        return Response({'error': 'This teacher account is already approved. Please log in.'}, status=status.HTTP_400_BAD_REQUEST)
+        existing = TeacherCredential.objects.filter(username=username).first()
+        if existing and existing.status == 'approved':
+            return Response({'error': 'This teacher account is already approved. Please log in.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if existing and existing.status == 'pending':
-        return Response({'error': 'A request with this username/email is already pending approval.'}, status=status.HTTP_400_BAD_REQUEST)
+        if existing and existing.status == 'pending':
+            return Response({'error': 'A request with this username/email is already pending approval.'}, status=status.HTTP_400_BAD_REQUEST)
 
-    if existing and existing.status == 'rejected':
-        existing.teacher_name = teacher_name
-        existing.assigned_class = assigned_class
-        existing.password = make_password(password)
-        existing.status = 'pending'
-        existing.save(update_fields=['teacher_name', 'assigned_class', 'password', 'status', 'updated_at'])
+        if existing and existing.status == 'rejected':
+            existing.teacher_name = teacher_name
+            existing.assigned_class = assigned_class
+            existing.password = make_password(password)
+            existing.status = 'pending'
+            existing.save(update_fields=['teacher_name', 'assigned_class', 'password', 'status', 'updated_at'])
+            return Response({'message': 'Teacher account request submitted and is pending approval.', 'status': 'pending'}, status=status.HTTP_201_CREATED)
+
+        TeacherCredential.objects.create(
+            teacher_name=teacher_name,
+            username=username,
+            password=make_password(password),
+            assigned_class=assigned_class,
+            status='pending',
+        )
         return Response({'message': 'Teacher account request submitted and is pending approval.', 'status': 'pending'}, status=status.HTTP_201_CREATED)
-
-    TeacherCredential.objects.create(
-        teacher_name=teacher_name,
-        username=username,
-        password=make_password(password),
-        assigned_class=assigned_class,
-        status='pending',
-    )
-    return Response({'message': 'Teacher account request submitted and is pending approval.', 'status': 'pending'}, status=status.HTTP_201_CREATED)
+    except Exception as exc:
+        logger.exception('Teacher registration failed')
+        if settings.DEBUG:
+            return Response({'error': f'Teacher registration failed: {exc}'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
+        return Response({'error': 'Teacher registration failed due to a server error.'}, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 
 @api_view(['POST'])
