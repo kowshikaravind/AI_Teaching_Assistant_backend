@@ -14,6 +14,7 @@ import os
 from pathlib import Path
 
 import dj_database_url
+from django.core.exceptions import ImproperlyConfigured
 
 # Build paths inside the project like this: BASE_DIR / 'subdir'.
 BASE_DIR = Path(__file__).resolve().parent.parent
@@ -29,7 +30,10 @@ SECRET_KEY = os.getenv('DJANGO_SECRET_KEY', 'django-insecure-dev-only-change-me'
 # Defaults to true for local development; set DJANGO_DEBUG=false for deployment.
 DEBUG = os.getenv('DJANGO_DEBUG', 'true').lower() in {'1', 'true', 'yes', 'on'}
 
-_hosts = os.getenv('DJANGO_ALLOWED_HOSTS', '127.0.0.1,localhost')
+_hosts = os.getenv(
+    'DJANGO_ALLOWED_HOSTS',
+    os.getenv('RENDER_EXTERNAL_HOSTNAME', '127.0.0.1,localhost')
+)
 ALLOWED_HOSTS = [host.strip() for host in _hosts.split(',') if host.strip()]
 
 
@@ -81,9 +85,25 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 
 # Database
 # https://docs.djangoproject.com/en/6.0/ref/settings/#databases
-DATABASES = {
-    'default': dj_database_url.parse('postgresql://academic_performance_tracking_system_user:zvu8EcKKxAHgGJayw5B051ykEfVapp7u@dpg-d7aahc2dbo4c73ce6o0g-a.oregon-postgres.render.com/academic_performance_tracking_system')
-}
+_database_url = os.getenv('DATABASE_URL', '').strip()
+if _database_url:
+    DATABASES = {
+        'default': dj_database_url.parse(
+            _database_url,
+            conn_max_age=600,
+            ssl_require=not DEBUG,
+        )
+    }
+else:
+    # Local fallback when DATABASE_URL is not set.
+    if not DEBUG:
+        raise ImproperlyConfigured('DATABASE_URL must be set when DEBUG is false.')
+    DATABASES = {
+        'default': {
+            'ENGINE': 'django.db.backends.sqlite3',
+            'NAME': BASE_DIR / 'db.sqlite3',
+        }
+    }
 
 
 # Password validation
@@ -121,6 +141,7 @@ USE_TZ = True
 # https://docs.djangoproject.com/en/6.0/howto/static-files/
 
 STATIC_URL = 'static/'
+STATIC_ROOT = BASE_DIR / 'staticfiles'
 
 # Uploaded files (study materials)
 MEDIA_URL = '/media/'
@@ -135,6 +156,21 @@ _cors_origins = os.getenv(
     'http://127.0.0.1:5174,https://ai-teaching-assistant-hk28.vercel.app'
 )
 CORS_ALLOWED_ORIGINS = [origin.strip() for origin in _cors_origins.split(',') if origin.strip()]
+
+_csrf_trusted = os.getenv(
+    'DJANGO_CSRF_TRUSTED_ORIGINS',
+    'https://ai-teaching-assistant-hk28.vercel.app'
+)
+CSRF_TRUSTED_ORIGINS = [origin.strip() for origin in _csrf_trusted.split(',') if origin.strip()]
+
+if not DEBUG:
+    SECURE_PROXY_SSL_HEADER = ('HTTP_X_FORWARDED_PROTO', 'https')
+    USE_X_FORWARDED_HOST = True
+    SESSION_COOKIE_SECURE = True
+    CSRF_COOKIE_SECURE = True
+    SECURE_HSTS_SECONDS = int(os.getenv('DJANGO_SECURE_HSTS_SECONDS', '31536000'))
+    SECURE_HSTS_INCLUDE_SUBDOMAINS = True
+    SECURE_HSTS_PRELOAD = True
 
 # AI safety controls for production deployment.
 APT_AI_LLM_ENABLED = os.getenv('APT_AI_LLM_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'on'}
