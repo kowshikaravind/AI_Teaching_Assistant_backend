@@ -126,16 +126,15 @@ STATIC_URL = 'static/'
 MEDIA_URL = '/media/'
 MEDIA_ROOT = BASE_DIR / 'media'
 
-# Allow React (Port 3000 and Vite Ports 5173-5174) to talk to Django
-CORS_ALLOWED_ORIGINS = [
-    "http://localhost:3000",
-    "http://127.0.0.1:3000",
-    "http://0.0.0.0:3000",
-    "http://localhost:5173",
-    "http://127.0.0.1:5173",
-    "http://localhost:5174",
-    "http://127.0.0.1:5174",
-]
+# CORS origins allowed to call this backend.
+# Configure with DJANGO_CORS_ALLOWED_ORIGINS as a comma-separated list in production.
+_cors_origins = os.getenv(
+    'DJANGO_CORS_ALLOWED_ORIGINS',
+    'http://localhost:3000,http://127.0.0.1:3000,http://0.0.0.0:3000,'
+    'http://localhost:5173,http://127.0.0.1:5173,http://localhost:5174,'
+    'http://127.0.0.1:5174,https://ai-teaching-assistant-hk28.vercel.app'
+)
+CORS_ALLOWED_ORIGINS = [origin.strip() for origin in _cors_origins.split(',') if origin.strip()]
 
 # AI safety controls for production deployment.
 APT_AI_LLM_ENABLED = os.getenv('APT_AI_LLM_ENABLED', 'true').lower() in {'1', 'true', 'yes', 'on'}
